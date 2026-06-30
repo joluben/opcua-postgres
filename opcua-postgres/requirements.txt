@@ -1,0 +1,15 @@
+# OPC-UA client (asyncio). La serie 0.9.x está obsoleta; usar 1.1.x/2.0
+asyncua>=1.1,<3.0
+
+# PostgreSQL async driver (alto rendimiento, COPY)
+# 0.29.x → PG 9.5–16 | 0.30.x → PG 17 | 0.31.x → PG 17–18
+asyncpg>=0.30,<0.32
+
+# Logging estructurado JSON
+structlog>=24.1
+
+# Métricas Prometheus
+prometheus_client>=0.20
+
+# Servidor HTTP ligero para /health y /metrics
+aiohttp>=3.9
