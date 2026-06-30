@@ -39,8 +39,3 @@ Thumbs.db
 # ── Logs ──────────────────────────────────────────────────────────────────────
 *.log
 logs/
-
-# ── Documentación ─────────────────────────────────────────────────────────────
-docs/
-docs/manual_implantacion.md
-docs/plan_implementacion_conector_opcua.md
