@@ -1,0 +1,78 @@
+version: "3.9"
+
+# ============================================================================
+# Despliegue de UN conector en producción.
+#
+# Pre-requisitos:
+#   1. Copiar .env.example → .env y completar POSTGRES_HOST, OPC_SERVER_URL, etc.
+#   2. Crear secrets/postgres_password.txt con la contraseña de BD (sin salto de línea).
+#   3. Opcionalmente crear secrets/opc_password.txt si el servidor OPC-UA usa autenticación.
+#   4. Montar certificados OPC-UA reales en ./certs/.
+#
+# IMPORTANTE: La base de datos (TimescaleDB) NO forma parte de este compose.
+# Se despliega y opera en un SERVIDOR INDEPENDIENTE. El conector se conecta a
+# POSTGRES_HOST (definido en .env) por red. pgBouncer, si se usa, vive en el host de BD.
+#
+# Escalado horizontal: ver docker-compose.scale.yml.
+# ============================================================================
+
+services:
+  connector-01:
+    build: .
+    image: opc-ua-connector:latest
+    container_name: opc-connector-01
+    restart: unless-stopped
+    env_file:
+      - .env                      # POSTGRES_HOST, OPC_SERVER_URL y resto de config no sensible
+    environment:
+      CONNECTOR_ID: connector-01
+      OPC_TAG_OFFSET: "0"
+      OPC_TAG_LIMIT: "5000"
+      # ── Seguridad ────────────────────────────────────────────────────────
+      # Las credenciales se inyectan vía Docker Secrets (convención *_FILE).
+      # NUNCA poner contraseñas en claro en este fichero ni en .env versionado.
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      OPC_PASSWORD_FILE: /run/secrets/opc_password
+      # Cifrado en tránsito hacia TimescaleDB (producción siempre require o verify-full).
+      POSTGRES_SSL_MODE: require
+      # ── Logs ─────────────────────────────────────────────────────────────
+      LOG_FORMAT: json
+      LOG_LEVEL: INFO
+      # Silencia los volcados de DataValue de la librería asyncua (WARNING por defecto).
+      OPC_LIB_LOG_LEVEL: WARNING
+    secrets:
+      - postgres_password
+      - opc_password
+    volumes:
+      - ./certs:/certs:ro                        # Certificados OPC-UA (solo lectura)
+      - connector_spill:/var/lib/connector/spill  # Buffer de spill persistente (no perder datos)
+    ports:
+      - "8001:8000"               # Métricas Prometheus + /health
+    networks:
+      - opc_network
+    # ── Límites de recursos ───────────────────────────────────────────────────
+    # Ajustar según el throughput real medido y el número de conectores en el host.
+    # Regla general: 1 core + 512 MB RAM por conector para cargas de ~10k val/s.
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          cpus: "0.25"
+          memory: 128M
+
+secrets:
+  postgres_password:
+    file: ./secrets/postgres_password.txt   # Archivo local; NUNCA versionado en git
+  opc_password:
+    file: ./secrets/opc_password.txt        # Vacío o inexistente si no hay autenticación OPC-UA
+
+volumes:
+  # El spill se escribe en un subdirectorio por CONNECTOR_ID, así varios
+  # conectores pueden compartir el volumen sin colisiones.
+  connector_spill:
+
+networks:
+  opc_network:
+    driver: bridge

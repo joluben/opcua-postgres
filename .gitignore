@@ -1,0 +1,48 @@
+# ── Secretos y configuración local (NUNCA commitear) ────────────────────────
+.env
+.env.*
+!.env.example
+secrets/
+*.secret
+
+# ── Certificados OPC-UA y claves privadas ────────────────────────────────────
+certs/
+*.pem
+*.der
+*.key
+*.pfx
+*.p12
+
+# ── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ── IDE / SO ──────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Documentación ─────────────────────────────────────────────────────────────
+docs/
+docs/manual_implantacion.md
+docs/plan_implementacion_conector_opcua.md
+
+.agents/*

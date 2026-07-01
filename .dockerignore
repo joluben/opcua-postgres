@@ -1,0 +1,40 @@
+# ============================================================================
+# .dockerignore — Contexto de build para la imagen de producción del conector.
+# Solo entra en la imagen: connector/, requirements.txt, Dockerfile.
+# ============================================================================
+
+# ── Artefactos de prueba y desarrollo ────────────────────────────────────────
+tools/
+tests/
+.pytest_cache/
+pytest.ini
+docker-compose.test.yml
+
+# ── Documentación (no necesaria en runtime) ───────────────────────────────────
+docs/
+*.md
+!README.md
+
+# ── Variables de entorno y credenciales ──────────────────────────────────────
+# Nunca deben entrar en la imagen ni en el contexto de build.
+.env
+secrets/
+certs/
+
+# ── Control de versiones y herramientas de desarrollo ─────────────────────────
+.git/
+.gitignore
+.github/
+
+# ── Compose de producción (no son código de la aplicación) ────────────────────
+docker-compose*.yml
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+.mypy_cache/
+.ruff_cache/
+dist/
+build/
+*.egg-info/
