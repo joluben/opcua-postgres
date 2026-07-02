@@ -1,0 +1,114 @@
+# ============================================================================
+# CI/CD — Conector OPC-UA → TimescaleDB
+#
+# Pipeline:
+#   1. Tests (pytest) sobre Python 3.12
+#   2. Build de imagen Docker multi-arch (amd64 + arm64) con buildx
+#   3. Push a GitHub Container Registry (ghcr.io)
+#
+# Triggers:
+#   - Push a main          → build + push (tag: latest + sha + branch)
+#   - Pull request         → tests + build (sin push)
+#   - Tag v*.*.*           → build + push (tag: semver + latest)
+#
+# Requisitos:
+#   - El repositorio debe tener permisos de escritura en Actions
+#     (Settings → Actions → General → Workflow permissions → Read and write)
+#   - GITHUB_TOKEN tiene permiso automático para ghcr.io
+# ============================================================================
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ── Job 1: Tests ──────────────────────────────────────────────────────────
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio
+
+      - name: Run tests
+        run: python -m pytest tests/ -q --tb=short
+
+  # ── Job 2: Build + Push ───────────────────────────────────────────────────
+  build:
+    name: Build & Push Image
+    needs: test
+    runs-on: ubuntu-latest
+    # Solo push en main o tags; en PRs solo build (sin push)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata (tags + labels)
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            # Semver en tags v1.0.0 → 1.0.0, 1.0, 1
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            # SHA corto en push a main
+            type=sha,prefix=sha-,format=short
+            # Branch name
+            type=ref,event=branch
+            # latest en main y tags
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ steps.meta.outputs.version || 'dev' }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Print image digest
+        if: github.event_name != 'pull_request'
+        run: echo "Imagen publicada en GHCR"

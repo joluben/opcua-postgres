@@ -45,7 +45,13 @@ services:
       - opc_password
     volumes:
       - ./certs:/certs:ro                        # Certificados OPC-UA (solo lectura)
-      - connector_spill:/var/lib/connector/spill  # Buffer de spill persistente (no perder datos)
+      # ── Spill persistente ──────────────────────────────────────────────────
+      # CRÍTICO: Este volumen DEBE ser persistente (named volume o bind mount).
+      # Si se omite o se usa el filesystem efímero del contenedor, los datos
+      # encolados durante una caída de BD se pierden al reiniciar el contenedor.
+      # En Kubernetes/Swarm, provisionar un PVC para /var/lib/connector/spill.
+      # NUNCA usar `docker compose down -v` en producción (elimina volúmenes).
+      - connector_spill:/var/lib/connector/spill  # Buffer de spill persistente
     ports:
       - "8001:8000"               # Métricas Prometheus + /health
     networks:

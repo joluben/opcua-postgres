@@ -28,7 +28,7 @@ LABEL org.opencontainers.image.title="opcua-connector" \
       org.opencontainers.image.description="OPC-UA → TimescaleDB ingestion connector" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.source="https://github.com/CHANGE_ME/opcua-postgres"
+      org.opencontainers.image.source="https://github.com/joluben/opcua-postgres"
 
 # Seguridad: ejecutar con usuario no-root
 RUN groupadd -r connector && useradd -r -g connector connector
