@@ -8,7 +8,7 @@ from connector.db.writer import BatchWriter, _COLUMNS
 
 def test_columns_order_matches_schema():
     assert _COLUMNS == [
-        "tag_id", "ts", "received_at", "value_num", "value_str", "quality", "connector_id"
+        "tag_id", "ts", "value_num", "value_str", "quality", "connector_id"
     ]
 
 

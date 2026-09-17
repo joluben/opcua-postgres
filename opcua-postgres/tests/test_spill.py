@@ -18,7 +18,7 @@ def _cfg(tmp_path):
 
 def _record():
     now = datetime.now(timezone.utc)
-    return (1, now, now, 42.0, None, 0, "connector-01")
+    return (1, now, 42.0, None, 0, "connector-01")
 
 
 def test_write_and_drain_roundtrip(tmp_path):
@@ -30,9 +30,9 @@ def test_write_and_drain_roundtrip(tmp_path):
 
     drained = sb.drain(10)
     assert len(drained) == 1
-    assert drained[0][0] == rec[0]
+    assert drained[0][0] == rec[0]      # tag_id
     assert drained[0][1] == rec[1]      # ts preservado
-    assert drained[0][3] == rec[3]
+    assert drained[0][2] == rec[2]      # value_num
     assert sb.has_data() is False
     sb.close()
 

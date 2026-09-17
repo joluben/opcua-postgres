@@ -3,8 +3,9 @@
 Pipeline (§9.2):
     asyncio.Queue  ->  Batch Accumulator (BATCH_SIZE o FLUSH_INTERVAL_MS)  ->  COPY FROM
 
-Cada registro es una tupla lista para COPY:
-    (tag_id, ts, received_at, value_num, value_str, quality, connector_id)
+Cada registro es una tupla lista para COPY (``received_at`` lo rellena el
+DEFAULT NOW() de la BD):
+    (tag_id, ts, value_num, value_str, quality, connector_id)
 """
 
 from __future__ import annotations
@@ -22,9 +23,9 @@ from .spill import SpillBuffer, enqueue_or_spill
 
 log = get_logger(__name__)
 
-Record = Tuple[int, object, object, object, object, int, str]
+Record = Tuple[int, object, object, object, int, str]
 
-_COLUMNS = ["tag_id", "ts", "received_at", "value_num", "value_str", "quality", "connector_id"]
+_COLUMNS = ["tag_id", "ts", "value_num", "value_str", "quality", "connector_id"]
 
 
 class BatchWriter:

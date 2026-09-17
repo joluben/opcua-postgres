@@ -24,7 +24,7 @@ log = get_logger(__name__)
 _MAX_DEPTH = 25
 
 
-@dataclass
+@dataclass(slots=True)
 class Tag:
     node: Node
     node_id: str

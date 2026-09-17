@@ -10,8 +10,9 @@ Límites:
   más antiguos (último recurso, registrado en ``opc_connector_spill_dropped_total``).
 - ``POSTGRES_SPILL_SEGMENT_MB``: tamaño de rotación de segmento.
 
-Cada registro es la tupla lista para COPY:
-    (tag_id, ts, received_at, value_num, value_str, quality, connector_id)
+Cada registro es la tupla lista para COPY (``received_at`` lo rellena el
+DEFAULT NOW() de la BD):
+    (tag_id, ts, value_num, value_str, quality, connector_id)
 """
 
 from __future__ import annotations
@@ -32,15 +33,15 @@ log = get_logger(__name__)
 _SEG_PREFIX = "spill-"
 _SEG_SUFFIX = ".jsonl"
 
-Record = Tuple[int, datetime, datetime, Optional[float], Optional[str], int, str]
+Record = Tuple[int, datetime, Optional[float], Optional[str], int, str]
 
 
 def _encode(r: Record) -> list:
-    return [r[0], r[1].isoformat(), r[2].isoformat(), r[3], r[4], r[5], r[6]]
+    return [r[0], r[1].isoformat(), r[2], r[3], r[4], r[5]]
 
 
 def _decode(a: list) -> Record:
-    return (a[0], datetime.fromisoformat(a[1]), datetime.fromisoformat(a[2]), a[3], a[4], a[5], a[6])
+    return (a[0], datetime.fromisoformat(a[1]), a[2], a[3], a[4], a[5])
 
 
 class SpillBuffer:

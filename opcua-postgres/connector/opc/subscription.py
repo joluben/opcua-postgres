@@ -30,7 +30,7 @@ class SubHandler:
     def __init__(
         self,
         queue: "asyncio.Queue",
-        node_to_tag: Dict[str, int],
+        node_to_tag: Dict[ua.NodeId, int],
         connector_id: str,
         spill: SpillBuffer | None = None,
     ) -> None:
@@ -41,8 +41,7 @@ class SubHandler:
 
     def datachange_notification(self, node, val, data) -> None:  # noqa: ANN001
         metrics.VALUES_RECEIVED.inc()
-        node_id = node.nodeid.to_string()
-        tag_id = self._node_to_tag.get(node_id)
+        tag_id = self._node_to_tag.get(node.nodeid)
         if tag_id is None:
             return
 
@@ -58,7 +57,6 @@ class SubHandler:
         record = (
             tag_id,
             ts,
-            datetime.now(timezone.utc),
             value_num,
             value_str,
             int(status),
@@ -76,7 +74,7 @@ async def subscribe(
     spill: SpillBuffer | None = None,
 ):
     """Crea la suscripción y registra los MonitoredItems de la partición local."""
-    node_to_tag = {t.node_id: t.tag_id for t in tags}
+    node_to_tag = {t.node.nodeid: t.tag_id for t in tags}
     handler = SubHandler(queue, node_to_tag, connector_id, spill)
 
     subscription = await client.create_subscription(cfg.publish_interval_ms, handler)
