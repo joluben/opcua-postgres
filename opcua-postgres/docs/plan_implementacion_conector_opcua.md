@@ -1,9 +1,20 @@
 # Plan de Implementación: Conector OPC-UA → TimescaleDB
 
-**Versión:** 1.3  
-**Fecha:** Junio 2026  
+**Versión:** 1.4  
+**Fecha:** Octubre 2026  
 **Clasificación:** Documento técnico interno
 
+> **Cambios v1.4:** Cierre del **hardening P0** (§18.1) y del **rediseño del *spill*** (§12.2):
+> - **Fail-closed**: defaults `OPC_SECURITY_MODE=SignAndEncrypt` y `POSTGRES_SSL_MODE=verify-full`;
+>   *allow-list* de políticas OPC-UA; el conector **no arranca** sin certificados en modo seguro;
+>   los modos inseguros emiten warning (§6.1, §7.1).
+> - **CA del servidor de BD** soportada vía `PGSSLROOTCERT` (fail-closed si el fichero no existe) (§6.2, §11).
+> - **Dependencias fijadas**: `requirements.lock` (pip-compile) y base de imagen por **digest** (§3, §10.1).
+> - **Spill con hilo dedicado**: el callback OPC-UA solo encola en memoria (`put_nowait`); un único hilo
+>   worker hace batching + `fsync`, rotación y *replay* por streaming, sin bloquear el event loop (§12.2).
+> - **Writer endurecido**: N writers COPY en paralelo (`POSTGRES_NUM_WRITERS`), `POSTGRES_COMMAND_TIMEOUT_S`,
+>   captura amplia de errores con *requeue* y métrica `opc_connector_batch_lag_seconds` (§9.2, §13.1).
+>
 > **Cambios v1.3:** Hardening de producción materializado: creados `.dockerignore` (contexto de build = 1.6 kB), `secrets/` con doble barrera de git, y actualizado `docker-compose.yml` con Docker Secrets (`postgres_password`, `opc_password`), `POSTGRES_SSL_MODE=require`, límites de recursos (`cpus: 1.0 / memory: 512M`) y logs JSON. §17.3 actualizado a completado. Nueva sección **§18 Próximos Pasos** con las tareas ordenadas por prioridad para cerrar la Fase 6 y habilitar el despliegue en producción.
 >
 > **Cambios v1.2:** Añadidos los **resultados de la validación end-to-end** (§14, Fase 5) ejecutada con el pipeline `docker-compose.test.yml` (TimescaleDB + simulador + conector). Nueva sección **§17 Paso a Producción** con el checklist detallado de tareas, *hardening* y la **limpieza de artefactos de prueba** (simulador, `tools/`, `tests/`, compose de test). Logging de `asyncua` silenciado por defecto (`OPC_LIB_LOG_LEVEL`).
@@ -106,17 +117,24 @@ OPC-UA Server
 
 ## 3. Stack Tecnológico
 
-| Componente | Tecnología | Versión recomendada | Justificación |
+| Componente | Tecnología | Versión (fijada en `requirements.lock`) | Justificación |
 |---|---|---|---|
-| Lenguaje | Python | 3.12+ | Soporte nativo asyncio, ecosistema OPC-UA maduro |
-| Cliente OPC-UA | `opcua-asyncio` (`asyncua`) | 1.1.x / 2.0 | Asíncrono nativo, soporte completo de seguridad, reconexión automática. La serie 0.9.x está obsoleta (2020-2021) |
+| Lenguaje | Python | 3.12 | Soporte nativo asyncio, ecosistema OPC-UA maduro |
+| Cliente OPC-UA | `opcua-asyncio` (`asyncua`) | 2.0.1 | Asíncrono nativo, soporte completo de seguridad, reconexión automática. Fijado a 2.0.x (parcheado contra el DoS de chunks PYSEC-2026-2385) |
 | Base de datos | TimescaleDB | 2.x sobre PG 16 | Compresión automática, hypertables, ingestión masiva. **Desplegada en servidor independiente** |
-| Driver DB | `asyncpg` | 0.29.x | Driver asíncrono de máximo rendimiento para PostgreSQL |
-| Contenerización | Docker + Docker Compose | 27.x | Despliegue reproducible, escalado sencillo |
+| Driver DB | `asyncpg` | 0.31.0 | Driver asíncrono de máximo rendimiento para PostgreSQL |
+| Contenerización | Docker + Docker Compose | 27.x | Despliegue reproducible, escalado sencillo. Base de imagen fijada por **digest** |
 | Pool de conexiones | pgBouncer (opcional, en host de BD) | 1.22.x | Solo necesario con muchos conectores. **Requiere `asyncpg` con `statement_cache_size=0`** en modo `transaction` (incompatibilidad de prepared statements) |
 | Gestión de secretos | Variables de entorno + Docker Secrets | — | Sin credenciales en el código ni en imágenes |
-| Logging | `structlog` | 24.x | Logs estructurados en JSON, integrables con ELK/Loki |
-| Métricas | `prometheus_client` | 0.20.x | Exposición de métricas para Prometheus/Grafana |
+| Servidor HTTP (métricas/health) | `aiohttp` | 3.14.3 | Ligero; fijado ≥3.13.3 por CVEs de smuggling/DoS 2025-2026 |
+| Serialización (spill) | `orjson` (fallback `json`) | 3.12.0 | Volcado a disco rápido del buffer de spill |
+| Logging | `structlog` | 25.4.0 | Logs estructurados en JSON, integrables con ELK/Loki |
+| Métricas | `prometheus_client` | 0.22.1 | Exposición de métricas para Prometheus/Grafana |
+| Criptografía | `cryptography` | 50.0.2 | Dependencia de `asyncua`/`pyopenssl` para TLS/certificados |
+
+> **Reproducibilidad:** las dependencias directas se declaran con rangos acotados en `requirements.txt`
+> y se resuelven a versiones exactas en **`requirements.lock`** (`pip-compile`), que es lo que instala
+> la imagen. La base `python:3.12-slim-bookworm` se referencia por digest.
 
 ---
 
@@ -134,9 +152,10 @@ opc-ua-connector/
 │   │   ├── subscription.py      # Motor de suscripción DataChange
 │   │   └── security.py          # Gestión de certificados y políticas de seguridad
 │   ├── db/
-│   │   ├── pool.py              # Pool de conexiones asyncpg
+│   │   ├── pool.py              # Pool de conexiones asyncpg (SSL/CA por PGSSLROOTCERT)
 │   │   ├── initializer.py       # Creación automática de tabla en primera conexión
-│   │   └── writer.py            # Escritura en lotes a TimescaleDB
+│   │   ├── writer.py            # Escritura en lotes a TimescaleDB (N writers COPY + requeue)
+│   │   └── spill.py             # Spill a disco con hilo dedicado (batching + fsync)
 │   └── utils/
 │       ├── logger.py            # Logger estructurado
 │       ├── metrics.py           # Métricas Prometheus
@@ -144,15 +163,18 @@ opc-ua-connector/
 ├── certs/                       # Certificados OPC-UA (montados como volumen)
 │   ├── client_cert.pem
 │   └── client_key.pem
-├── Dockerfile
+├── Dockerfile                   # Multi-stage, usuario no-root, base fijada por digest
 ├── docker-compose.yml           # Despliegue de un conector (base)
 ├── docker-compose.scale.yml     # Despliegue de múltiples conectores en paralelo
 ├── .env.example                 # Plantilla de variables de entorno (sin valores reales)
-├── requirements.txt
+├── requirements.txt             # Dependencias directas (rangos acotados)
+├── requirements.lock            # Versiones exactas resueltas (pip-compile)
 └── tests/
     ├── test_browser.py
+    ├── test_security.py
     ├── test_writer.py
-    └── test_security.py
+    ├── test_spill.py
+    └── test_pool.py
 ```
 
 ---
@@ -241,10 +263,10 @@ Toda la configuración del conector se realiza exclusivamente a través de varia
 | `OPC_SERVER_URL` | ✅ | `opc.tcp://192.168.1.10:4840` | URL del servidor OPC-UA |
 | `OPC_USERNAME` | ⚠️ | `admin` | Usuario (si el servidor requiere autenticación) |
 | `OPC_PASSWORD` | ⚠️ | *(secreto)* | Contraseña del usuario OPC-UA |
-| `OPC_SECURITY_POLICY` | ✅ | `Basic256Sha256` | Ver sección 7 para opciones |
-| `OPC_SECURITY_MODE` | ✅ | `SignAndEncrypt` | `None`, `Sign`, `SignAndEncrypt` |
-| `OPC_CERTIFICATE_PATH` | ⚠️ | `/certs/client_cert.pem` | Requerido si security mode ≠ None |
-| `OPC_PRIVATE_KEY_PATH` | ⚠️ | `/certs/client_key.pem` | Requerido si security mode ≠ None |
+| `OPC_SECURITY_POLICY` | ✅ | `Basic256Sha256` | Ver sección 7. *Allow-list*: `Basic256Sha256`, `Aes128_Sha256_RsaOaep`, `Aes256_Sha256_RsaPss` |
+| `OPC_SECURITY_MODE` | ✅ | `SignAndEncrypt` | `None`, `Sign`, `SignAndEncrypt`. **Default fail-closed**; `None` emite warning |
+| `OPC_CERTIFICATE_PATH` | ⚠️ | `/certs/client_cert.pem` | **Obligatorio** si security mode ≠ None (el conector no arranca sin él) |
+| `OPC_PRIVATE_KEY_PATH` | ⚠️ | `/certs/client_key.pem` | **Obligatorio** si security mode ≠ None |
 | `OPC_PUBLISH_INTERVAL_MS` | ✅ | `100` | Intervalo de publicación en ms (100–500) |
 | `OPC_NAMESPACE_INDEX` | ❌ | `2` | Filtrar por namespace específico (opcional) |
 | `OPC_NODE_ID_FILTER` | ❌ | `ns=2;s=Planta1.*` | Patrón glob para filtrar nodos (opcional) |
@@ -256,7 +278,7 @@ Toda la configuración del conector se realiza exclusivamente a través de varia
 
 ### 6.2 Variables de conexión PostgreSQL / TimescaleDB
 
-> La base de datos reside en un **servidor independiente**. `POSTGRES_HOST` apunta al host remoto (DNS interno o IP), no a un servicio del mismo `docker-compose`. Usar `POSTGRES_SSL_MODE=require` en producción.
+> La base de datos reside en un **servidor independiente**. `POSTGRES_HOST` apunta al host remoto (DNS interno o IP), no a un servicio del mismo `docker-compose`. Usar `POSTGRES_SSL_MODE=verify-full` en producción (con la CA del servidor, ver §6.2 `PGSSLROOTCERT`).
 
 | Variable | Obligatoria | Ejemplo | Descripción |
 |---|---|---|---|
@@ -271,13 +293,17 @@ Toda la configuración del conector se realiza exclusivamente a través de varia
 | `POSTGRES_FLUSH_INTERVAL_MS` | ✅ | `500` | Máximo tiempo entre escrituras |
 | `POSTGRES_POOL_MIN` | ❌ | `2` | Conexiones mínimas en el pool |
 | `POSTGRES_POOL_MAX` | ❌ | `10` | Conexiones máximas en el pool |
+| `POSTGRES_NUM_WRITERS` | ❌ | `2` | Writers COPY en paralelo (1–8), todos sobre la misma cola |
+| `POSTGRES_COMMAND_TIMEOUT_S` | ❌ | `15` | Timeout por comando SQL (s); evita que un flush bloquee la ingesta |
 | `POSTGRES_STATEMENT_CACHE_SIZE` | ❌ | `100` | Caché de prepared statements; **poner `0` si se usa pgBouncer (transaction)** |
 | `POSTGRES_USE_TIMESCALE` | ❌ | `true` | `true`: hypertable + compresión. `false`: PostgreSQL plano (sin hypertable) |
 | `POSTGRES_SPILL_ENABLED` | ❌ | `true` | Activa el volcado a disco del buffer ante caídas largas de BD |
 | `POSTGRES_SPILL_DIR` | ❌ | `/var/lib/connector/spill` | Directorio del spill (debe ser **volumen persistente**) |
 | `POSTGRES_SPILL_MAX_MB` | ❌ | `1024` | Tope total en disco; al superarlo se descartan segmentos antiguos |
 | `POSTGRES_SPILL_SEGMENT_MB` | ❌ | `64` | Tamaño de rotación de segmento |
-| `POSTGRES_SSL_MODE` | ❌ | `require` | `disable`, `allow`, `prefer`, `require` |
+| `POSTGRES_SPILL_FSYNC_EVERY` | ❌ | `100` | `fsync` cada N escrituras (durabilidad vs throughput) |
+| `POSTGRES_SSL_MODE` | ❌ | `verify-full` | `disable`, `allow`, `prefer`, `require`, `verify-ca`, `verify-full`. **Default fail-closed**; los modos sin verificación emiten warning |
+| `PGSSLROOTCERT` | ❌ | — | Ruta a la CA del servidor de BD (para `verify-ca`/`verify-full` si no está en el store del sistema). Fail-closed si el fichero no existe |
 
 ### 6.3 Variables operacionales
 
@@ -297,9 +323,9 @@ Toda la configuración del conector se realiza exclusivamente a través de varia
 # ── OPC-UA Connection ──────────────────────────────────────────────────────
 OPC_SERVER_URL=opc.tcp://CHANGE_ME:4840
 OPC_USERNAME=
-OPC_PASSWORD=
+OPC_PASSWORD_FILE=/run/secrets/opc_password
 OPC_SECURITY_POLICY=Basic256Sha256
-OPC_SECURITY_MODE=SignAndEncrypt
+OPC_SECURITY_MODE=SignAndEncrypt        # default fail-closed
 OPC_CERTIFICATE_PATH=/certs/client_cert.pem
 OPC_PRIVATE_KEY_PATH=/certs/client_key.pem
 OPC_PUBLISH_INTERVAL_MS=500
@@ -311,14 +337,23 @@ OPC_TAG_LIMIT=5000
 # ── PostgreSQL / TimescaleDB ────────────────────────────────────────────────
 POSTGRES_HOST=db.internal.example   # Servidor de BD independiente (host remoto)
 POSTGRES_PORT=5432
-POSTGRES_SSL_MODE=require
+POSTGRES_SSL_MODE=verify-full       # fail-closed
+PGSSLROOTCERT=/certs/ca.pem         # opcional si la CA está en el store del sistema
 POSTGRES_DB=scada_db
 POSTGRES_USER=connector_user
-POSTGRES_PASSWORD=CHANGE_ME
+POSTGRES_PASSWORD_FILE=/run/secrets/postgres_password
 POSTGRES_CATALOG_TABLE=opc_tags_catalog
 POSTGRES_DATA_TABLE=opc_raw_values
 POSTGRES_BATCH_SIZE=1000
 POSTGRES_FLUSH_INTERVAL_MS=500
+POSTGRES_NUM_WRITERS=2
+POSTGRES_COMMAND_TIMEOUT_S=15
+
+# ── Spill a disco ─────────────────────────────────────────────────────────────
+POSTGRES_SPILL_ENABLED=true
+POSTGRES_SPILL_MAX_MB=1024
+POSTGRES_SPILL_SEGMENT_MB=64
+POSTGRES_SPILL_FSYNC_EVERY=100
 
 # ── Connector Identity ──────────────────────────────────────────────────────
 CONNECTOR_ID=connector-01
@@ -340,10 +375,15 @@ El conector soportará los tres niveles de seguridad OPC-UA. La elección se hac
 
 | Nivel | `OPC_SECURITY_MODE` | `OPC_SECURITY_POLICY` | Caso de uso recomendado |
 |---|---|---|---|
-| Sin seguridad | `None` | `None` | Redes industriales completamente aisladas (air-gap) |
+| Sin seguridad | `None` | *(ignorada)* | Redes industriales completamente aisladas (air-gap). Emite warning |
 | Solo firma | `Sign` | `Basic256Sha256` | Redes internas con VLAN segregada |
 | Firma + cifrado | `SignAndEncrypt` | `Basic256Sha256` | **Recomendado por defecto** |
-| Firma + cifrado | `SignAndEncrypt` | `Aes128Sha256RsaOaep` | Servidores OPC-UA modernos (UA 1.04+) |
+| Firma + cifrado | `SignAndEncrypt` | `Aes128_Sha256_RsaOaep` | Servidores OPC-UA modernos (UA 1.04+) |
+| Firma + cifrado | `SignAndEncrypt` | `Aes256_Sha256_RsaPss` | Servidores OPC-UA que exigen RSA-PSS |
+
+> **Allow-list (fail-closed):** solo se aceptan `Basic256Sha256`, `Aes128_Sha256_RsaOaep` y
+> `Aes256_Sha256_RsaPss`. Se **rechazan** las obsoletas `Basic128Rsa15` y `Basic256`. Con
+> `SECURITY_MODE != None` el conector **no arranca** si faltan `OPC_CERTIFICATE_PATH`/`OPC_PRIVATE_KEY_PATH`.
 
 ### 7.2 Gestión de certificados X.509
 
@@ -369,7 +409,7 @@ Los certificados se montan como **volúmenes Docker** en `/certs/` y **nunca** s
 - Soporte para **Docker Secrets** como alternativa más segura a variables de entorno planas.
 - Certificados con validez máxima de 3 años, con proceso documentado de renovación.
 - El usuario de PostgreSQL del conector tendrá permisos mínimos: `INSERT`/`SELECT` en la tabla de datos y `INSERT`/`SELECT`/`UPDATE` en el catálogo (necesita actualizar `updated_at` y `active`).
-- Conexión a PostgreSQL con `SSL` habilitado en entornos productivos (`POSTGRES_SSL_MODE=require`).
+- Conexión a PostgreSQL con `SSL` habilitado en entornos productivos (`POSTGRES_SSL_MODE=verify-full`; `require` solo como último recurso, con warning).
 - Logs sin datos de valor (solo metadata) para evitar exposición accidental de datos de proceso.
 - El contenedor Docker se ejecuta con usuario no-root (`USER connector` en el Dockerfile).
 
@@ -434,8 +474,10 @@ Por cada conector:
   1 Subscription → N MonitoredItems (uno por tag)
   └─ PublishInterval: 100ms – 500ms (configurable por env)
   └─ SamplingInterval: igual al PublishInterval
-  └─ QueueSize: 10 (buffer en el servidor para valores no entregados)
-  └─ DataChangeFilter: deadband configurable (OPC_DATACHANGE_DEADBAND) para señales analógicas
+  └─ QueueSize: 100 (buffer en el servidor para valores no entregados)
+  └─ DataChangeFilter: deadband configurable (OPC_DATACHANGE_DEADBAND + OPC_DEADBAND_TYPE:
+     None / Absolute / Percent), aplicado a MonitoringParameters
+  └─ CreateMonitoredItems en bloques de 1000 nodos (evita superar MaxMonitoredItems/PDU)
 ```
 
 ### 9.2 Pipeline asíncrono de procesamiento
@@ -443,22 +485,27 @@ Por cada conector:
 ```
 DataChange Callback (datachange_notification, ejecutado en el event loop asyncio,
                      NO en un hilo separado)
-         │
-         ▼ put_nowait()
-   asyncio.Queue (buffer en memoria, OPC_QUEUE_MAX_SIZE, p.ej. 500.000 items)
-         │
-         ▼ get_batch()
-   Batch Accumulator
-   ├── Espera hasta POSTGRES_BATCH_SIZE items
-   └── O hasta POSTGRES_FLUSH_INTERVAL_MS ms (lo que ocurra primero)
-         │
-         ▼
-   Batch Writer (asyncpg)
-   └── COPY FROM (método más rápido de inserción masiva en PostgreSQL)
-         │
-         ▼
-   TimescaleDB hypertable
+         │  put_nowait()  ──►  asyncio.Queue (buffer en memoria, OPC_QUEUE_MAX_SIZE)
+         │                       │   [cola llena → spill.write(): put_nowait a la cola
+         │                       │    interna del spill; NUNCA bloquea el event loop]
+         ▼                       ▼
+   SpillBuffer (hilo            Batch Accumulator (por cada writer)
+   worker dedicado:             ├── Espera hasta POSTGRES_BATCH_SIZE items
+   batching + fsync +           └── O hasta POSTGRES_FLUSH_INTERVAL_MS ms
+   rotación + replay FIFO)           │
+         ▲                            ▼
+         └── replay ◄──── Batch Writer × N (POSTGRES_NUM_WRITERS, asyncpg)
+                                       └── COPY FROM  ──►  TimescaleDB hypertable
 ```
+
+> **Spill sin bloqueo:** el *callback* OPC-UA (event loop) solo hace `put_nowait` en la cola
+> interna del spill; un **único hilo worker** (dueño de los ficheros) hace el batching a disco
+> (hasta 1000 registros por `write`), el `fsync` por lotes, la rotación, el *enforce* del tope y
+> el *replay* por streaming. El `drain` async se coordina por `loop.call_soon_threadsafe`, sin
+> `to_thread` ni locks compartidos con el loop.
+>
+> **Multi-writer:** `POSTGRES_NUM_WRITERS` (default 2) instancias de `BatchWriter` consumen la
+> misma cola; solo el worker 0 reinyecta el spill (evita duplicados).
 
 ### 9.3 Rendimiento esperado por conector
 
@@ -480,30 +527,49 @@ DataChange Callback (datachange_notification, ejecutado en el event loop asyncio
 ### 10.1 Dockerfile
 
 ```dockerfile
-FROM python:3.12-slim
+# Base fijada por digest (build reproducible; actualizar vía `docker buildx imagetools inspect`)
+FROM python:3.12-slim-bookworm@sha256:54c85f3c47607a77f32adec749d3c81d1348bf25833671f512b26a9b6d778cb3 AS builder
+
+WORKDIR /build
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt requirements.lock ./
+RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.lock
+
+FROM python:3.12-slim-bookworm@sha256:54c85f3c47607a77f32adec749d3c81d1348bf25833671f512b26a9b6d778cb3 AS runtime
+
+ARG VERSION=dev
+ENV VERSION=${VERSION}
+LABEL org.opencontainers.image.title="opcua-connector" \
+      org.opencontainers.image.version="${VERSION}"
 
 # Seguridad: ejecutar con usuario no-root
 RUN groupadd -r connector && useradd -r -g connector connector
 
 WORKDIR /app
 
-# Instalar dependencias del sistema para opcua-asyncio
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
+    libssl3 && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=builder /build/wheels /wheels
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.lock \
+    && rm -rf /wheels && pip check
 
 COPY connector/ ./connector/
 
-# El directorio de certificados se monta como volumen externo
-RUN mkdir /certs && chown connector:connector /certs
+# Certificados (volumen externo) y directorio de spill con propietario no-root
+RUN mkdir /certs && chown connector:connector /certs \
+    && mkdir -p /var/lib/connector/spill && chown -R connector:connector /var/lib/connector
 
 USER connector
+EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:${METRICS_PORT:-8000}/health')"
+    CMD python -c "import urllib.request,os; urllib.request.urlopen('http://localhost:%s/health' % os.getenv('METRICS_PORT','8000'), timeout=5)"
 
 CMD ["python", "-m", "connector.main"]
 ```
@@ -529,20 +595,36 @@ services:
       CONNECTOR_ID: connector-01
       OPC_TAG_OFFSET: "0"
       OPC_TAG_LIMIT: "5000"
-      # El conector lee la contraseña desde el fichero del secret (convención *_FILE)
+      # Credenciales vía Docker Secrets (convención *_FILE)
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+      OPC_PASSWORD_FILE: /run/secrets/opc_password
+      # Cifrado en tránsito hacia la BD (verifica CA + hostname)
+      POSTGRES_SSL_MODE: verify-full
+      PGSSLROOTCERT: /certs/ca.pem
     secrets:
       - postgres_password
+      - opc_password
     volumes:
-      - ./certs:/certs:ro       # Certificados montados en solo lectura
+      - ./certs:/certs:ro                        # Certificados OPC-UA + CA de BD (solo lectura)
+      - connector_spill:/var/lib/connector/spill  # Buffer de spill persistente
     ports:
-      - "8001:8000"             # Métricas Prometheus
+      - "8001:8000"             # Métricas Prometheus + /health
     networks:
       - opc_network
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
 secrets:
   postgres_password:
     file: ./secrets/postgres_password.txt   # Archivo local, nunca en git
+  opc_password:
+    file: ./secrets/opc_password.txt        # Vacío si el servidor OPC-UA no requiere auth
+
+volumes:
+  connector_spill:                          # Persistente: sin él se pierde el spill
 
 networks:
   opc_network:
@@ -658,6 +740,7 @@ La cola asíncrona interna actúa como buffer durante micro-interrupciones de la
 
 - Capacidad: `OPC_QUEUE_MAX_SIZE` (por defecto 500.000 items, configurable). A ~50.000 rows/s eso equivale a **~10 segundos** de datos; a tasas menores, más. Dimensionar según la ventana de tolerancia a fallos deseada vs. memoria disponible (cada item ocupa del orden de cientos de bytes).
 - Si el buffer se llena (la BD remota lleva caída más tiempo que la ventana del buffer), los registros se **vuelcan a disco** (*spill*, `POSTGRES_SPILL_*`) en lugar de descartarse, y se reinyectan automáticamente al recuperarse la BD. El directorio de spill debe estar en un **volumen persistente** para sobrevivir a reinicios del contenedor.
+- El spill lo gestiona un **hilo worker dedicado**: el *callback* OPC-UA solo encola en memoria (`put_nowait`), de modo que **nunca bloquea el event loop**; el worker hace batching (hasta 1000 registros por `write`), `fsync` por lotes (`POSTGRES_SPILL_FSYNC_EVERY`), rotación por segmentos (`POSTGRES_SPILL_SEGMENT_MB`), *enforce* del tope y *replay* FIFO por streaming. Permisos `0700` (dir) / `0600` (segmentos).
 - Solo si el spill está **deshabilitado** o se alcanza su tope de disco (`POSTGRES_SPILL_MAX_MB`) se descarta el dato más antiguo (*drop-oldest*), incrementando `opc_connector_values_dropped_total` / `opc_connector_spill_dropped_total`. **Debe definirse el SLA de pérdida aceptable.**
 - Los datos con `quality != Good` (StatusCode OPC-UA ≠ 0) se registran pero se marcan en la columna `quality`.
 
@@ -686,10 +769,17 @@ La cola asíncrona interna actúa como buffer durante micro-interrupciones de la
 | `opc_connector_values_written_total` | Counter | Valores escritos exitosamente en TimescaleDB |
 | `opc_connector_values_dropped_total` | Counter | Valores descartados por buffer lleno |
 | `opc_connector_queue_size` | Gauge | Tamaño actual del buffer en memoria |
-| `opc_connector_write_latency_seconds` | Histogram | Latencia de escritura en DB |
+| `opc_connector_batch_lag_seconds` | Gauge | Retraso del registro más antiguo del lote (ts OPC → flush) |
+| `opc_connector_write_latency_seconds` | Histogram | Latencia de escritura (COPY) en DB |
 | `opc_connector_db_errors_total` | Counter | Errores de escritura en DB |
 | `opc_connector_opc_reconnections_total` | Counter | Reconexiones al servidor OPC-UA |
 | `opc_connector_session_status` | Gauge | Estado de la sesión OPC-UA (1=conectado, 0=desconectado) |
+| `opc_connector_db_status` | Gauge | Estado de la conexión a BD (1=ok, 0=ko) |
+| `opc_connector_spill_written_total` | Counter | Registros volcados al spill a disco |
+| `opc_connector_spill_replayed_total` | Counter | Registros reinyectados desde el spill |
+| `opc_connector_spill_dropped_total` | Counter | Segmentos de spill descartados por tope de disco |
+| `opc_connector_spill_bytes` | Gauge | Bytes actuales en el spill a disco |
+| `opc_connector_spill_files` | Gauge | Nº de segmentos de spill en disco |
 
 ### 13.2 Health check endpoint
 
@@ -721,10 +811,14 @@ GET /health  →  200 OK  {"status": "healthy", "opc_connected": true, "db_conne
 > validado · 🔶 parcial · ⬜ pendiente.
 >
 > **Limitaciones conocidas:** (1) aún **sin validación contra el servidor OPC-UA real del proveedor**
-> (solo simulador `asyncua`); (2) el *spill* a disco escribe de forma síncrona en el callback durante
-> el desbordamiento (vía excepcional aceptable, a revisar si la tasa de overflow es muy alta);
-> (3) el **techo real de throughput por conector aún no se ha medido**: el simulador (escritura
-> secuencial) satura en ~7.500 cambios/s, por debajo del objetivo, por lo que no marca el límite del conector.
+> (solo simulador `asyncua`); (2) el **techo real de throughput por conector aún no se ha medido**:
+> el simulador (escritura secuencial) satura en ~7.500 cambios/s, por debajo del objetivo, por lo que
+> no marca el límite del conector.
+>
+> **Resuelto en v1.4:** ✅ el *spill* ya **no escribe de forma síncrona en el callback**: se gestiona en
+> un **hilo worker dedicado** que nunca bloquea el event loop (§12.2). ✅ Defaults fail-closed
+> (`SignAndEncrypt` + `verify-full`), ✅ deadband aplicado + suscripción por bloques de 1000,
+> ✅ dependencias fijadas (`requirements.lock` + digest).
 >
 > **Resueltas en v1.1:** ✅ **Modo PostgreSQL sin TimescaleDB** (`POSTGRES_USE_TIMESCALE=false`,
 > omite hypertable y compresión). ✅ **Spill a disco** del buffer (`POSTGRES_SPILL_*`): ante caídas
@@ -965,7 +1059,10 @@ opc-ua-connector/                 (release)
 | ✅ `.dockerignore` | Contexto de build = 1.6 kB; excluye `tools/`, `tests/`, `.env`, `certs/`, `secrets/`, `docs/`, compose de test |
 | ✅ Directorio `secrets/` con doble barrera de git | `.gitignore` raíz + `.gitignore` interno; `README.md` con instrucciones de creación sin salto de línea |
 | ✅ Credenciales vía **Docker Secrets** | `POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password`, `OPC_PASSWORD_FILE: /run/secrets/opc_password` |
-| ✅ `POSTGRES_SSL_MODE=require` | Fijado en `docker-compose.yml` `environment:` (no sobreescribible por error en `.env`) |
+| ✅ `POSTGRES_SSL_MODE=verify-full` | Fijado en `docker-compose.yml` `environment:` + `PGSSLROOTCERT=/certs/ca.pem` (no sobreescribible por error en `.env`) |
+| ✅ Defaults **fail-closed** | `OPC_SECURITY_MODE=SignAndEncrypt` y `POSTGRES_SSL_MODE=verify-full`; el conector **aborta** si faltan certificados con modo seguro; los modos inseguros emiten warning |
+| ✅ Dependencias fijadas | `requirements.lock` (pip-compile) instalado por la imagen + base `python:3.12-slim-bookworm` por **digest** |
+| ✅ Spill sin bloquear el event loop | Hilo worker dedicado (batching + `fsync` + replay); directorio `0700`, segmentos `0600` |
 | ✅ `LOG_FORMAT=json` y `OPC_LIB_LOG_LEVEL=WARNING` | Integración con ELK/Loki; volcados de `asyncua` silenciados |
 | ✅ Límites de recursos | `cpus: 1.0 / memory: 512M`; reservaciones `0.25 cpu / 128M RAM` en `deploy.resources` |
 | ✅ `restart: unless-stopped` | Ya presente; `RECONNECT_MAX_RETRIES` configurable |
@@ -1016,6 +1113,18 @@ Ordenados por prioridad para cerrar la Fase 6 y alcanzar el **gate de despliegue
 | ✅ 3 | **Publicar imagen en registro privado** | `Makefile` creado con targets `build`, `tag`, `push`, `up`, `down`, `test`, `logs`; uso: `make build VERSION=1.3.0 REGISTRY=registry.example.com && make push` |
 | ✅ 4 | **`POSTGRES_SSL_MODE=verify-full`** | Corregido bug en `connector/db/pool.py::_build_ssl`: `verify-ca` y `verify-full` ahora generan `SSLContext` con `CERT_REQUIRED`; `require` cifra sin verificar CA; modos documentados en `.env.example` |
 
+### 18.1b Completado en v1.4 (hardening P0 + rediseño del spill)
+
+| # | Tarea | Detalle |
+|---|---|---|
+| ✅ 5 | **Defaults fail-closed** | `OPC_SECURITY_MODE=SignAndEncrypt`, `POSTGRES_SSL_MODE=verify-full`; *allow-list* de políticas; el conector **aborta** sin certificados con modo seguro |
+| ✅ 6 | **CA de BD por `PGSSLROOTCERT`** | Implementado en `connector/db/pool.py` (fail-closed si el fichero no existe) |
+| ✅ 7 | **Deadband + chunking** | `DataChangeFilter` (`None`/`Absolute`/`Percent`) aplicado a `MonitoringParameters`; suscripción en bloques de 1000 |
+| ✅ 8 | **Spill con hilo dedicado** | `write()` sin I/O (`put_nowait`); worker con batching + `fsync` + replay por streaming; sin locks compartidos con el event loop |
+| ✅ 9 | **Writer endurecido** | N writers COPY (`POSTGRES_NUM_WRITERS`), `POSTGRES_COMMAND_TIMEOUT_S=15`, *requeue* + backoff con jitter, métrica `opc_connector_batch_lag_seconds` |
+| ✅ 10 | **Dependencias y base fijadas** | `requirements.lock` (pip-compile) + base `python:3.12-slim-bookworm` por digest |
+| ✅ 11 | **Tests** | 21 tests unitarios, incluyendo `test_spill.py` y `test_pool.py` (SSL/CA) |
+
 ### 18.2 Medio plazo — pruebas de carga y servidor real (3–5 días)
 
 | # | Tarea | Criterio de aceptación | Estado |
@@ -1055,4 +1164,4 @@ Antes de apagar el acceso al servidor de pruebas y pasar a producción, verifica
 
 ---
 
-*Fin del documento — Plan de Implementación Conector OPC-UA v1.3*
+*Fin del documento — Plan de Implementación Conector OPC-UA v1.4*
