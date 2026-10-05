@@ -5,7 +5,10 @@
 ARG VERSION=dev
 
 # ── Builder: compila dependencias en un entorno aislado ──────────────────────
-FROM python:3.12-slim AS builder
+# Base fijada por digest (reproducibilidad + inmune a re-tag del mismo tag).
+# Para actualizar: docker buildx imagetools inspect python:3.12-slim-bookworm
+# y sustituir el sha256 (idealmente vía Dependabot/Renovate).
+FROM python:3.12-slim-bookworm@sha256:54c85f3c47607a77f32adec749d3c81d1348bf25833671f512b26a9b6d778cb3 AS builder
 
 WORKDIR /build
 
@@ -14,14 +17,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt .
-RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.txt
+COPY requirements.txt requirements.lock ./
+RUN pip wheel --no-cache-dir --wheel-dir /build/wheels -r requirements.lock
 
 # ── Runtime: imagen final mínima, sin toolchain de compilación ───────────────
-FROM python:3.12-slim AS runtime
+FROM python:3.12-slim-bookworm@sha256:54c85f3c47607a77f32adec749d3c81d1348bf25833671f512b26a9b6d778cb3 AS runtime
 
 # Reutilizar ARG en el stage runtime
 ARG VERSION=dev
+ENV VERSION=${VERSION}
 
 # Metadatos OCI estándar (inspeccionables con `docker inspect <image>`)
 LABEL org.opencontainers.image.title="opcua-connector" \
@@ -40,9 +44,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/wheels /wheels
-COPY requirements.txt .
-RUN pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.txt \
-    && rm -rf /wheels
+COPY requirements.txt requirements.lock ./
+RUN pip install --no-cache-dir --upgrade pip \
+    && pip install --no-cache-dir --no-index --find-links=/wheels -r requirements.lock \
+    && rm -rf /wheels \
+    && pip check
 
 COPY connector/ ./connector/
 
@@ -59,7 +65,8 @@ USER connector
 EXPOSE 8000
 
 # Health check contra el endpoint HTTP del propio conector
+# P0: timeout explícito en el probe para no colgar el healthcheck.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request,os; urllib.request.urlopen('http://localhost:%s/health' % os.getenv('METRICS_PORT','8000'))"
+    CMD python -c "import urllib.request,os; urllib.request.urlopen('http://localhost:%s/health' % os.getenv('METRICS_PORT','8000'), timeout=5)"
 
 CMD ["python", "-m", "connector.main"]

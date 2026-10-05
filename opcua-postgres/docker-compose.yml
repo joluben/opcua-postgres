@@ -7,7 +7,8 @@ version: "3.9"
 #   1. Copiar .env.example → .env y completar POSTGRES_HOST, OPC_SERVER_URL, etc.
 #   2. Crear secrets/postgres_password.txt con la contraseña de BD (sin salto de línea).
 #   3. Opcionalmente crear secrets/opc_password.txt si el servidor OPC-UA usa autenticación.
-#   4. Montar certificados OPC-UA reales en ./certs/.
+#   4. Montar certificados OPC-UA reales en ./certs/ y la CA del servidor de BD
+#      en ./certs/ca.pem (necesaria para POSTGRES_SSL_MODE=verify-full).
 #
 # IMPORTANTE: La base de datos (TimescaleDB) NO forma parte de este compose.
 # Se despliega y opera en un SERVIDOR INDEPENDIENTE. El conector se conecta a
@@ -33,8 +34,12 @@ services:
       # NUNCA poner contraseñas en claro en este fichero ni en .env versionado.
       POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
       OPC_PASSWORD_FILE: /run/secrets/opc_password
-      # Cifrado en tránsito hacia TimescaleDB (producción siempre require o verify-full).
-      POSTGRES_SSL_MODE: require
+      # Cifrado en tránsito hacia TimescaleDB: verify-full (verifica CA + hostname).
+      # La CA del servidor de BD se monta en ./certs/ca.pem (ver volúmenes) y se
+      # referencia con PGSSLROOTCERT. Si la CA está en el store del sistema, basta
+      # con POSTGRES_SSL_MODE=verify-full y omitir PGSSLROOTCERT.
+      POSTGRES_SSL_MODE: verify-full
+      PGSSLROOTCERT: /certs/ca.pem
       # ── Logs ─────────────────────────────────────────────────────────────
       LOG_FORMAT: json
       LOG_LEVEL: INFO
@@ -44,7 +49,7 @@ services:
       - postgres_password
       - opc_password
     volumes:
-      - ./certs:/certs:ro                        # Certificados OPC-UA (solo lectura)
+      - ./certs:/certs:ro                        # Certificados OPC-UA + CA de BD (ca.pem), solo lectura
       - connector_spill:/var/lib/connector/spill  # Buffer de spill persistente (no perder datos)
     ports:
       - "8001:8000"               # Métricas Prometheus + /health

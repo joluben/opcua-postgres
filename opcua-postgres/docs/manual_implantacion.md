@@ -1,8 +1,15 @@
 # Manual de Implantación — Conector OPC-UA → TimescaleDB
 
-**Versión:** 1.0  
-**Fecha:** Junio 2026  
+**Versión:** 1.1  
+**Fecha:** Octubre 2026  
 **Clasificación:** Documento técnico operativo
+
+> **Cambios v1.1:** alineado con el conector v1.1.0. Defaults **fail-closed**
+> (`OPC_SECURITY_MODE=SignAndEncrypt`, `POSTGRES_SSL_MODE=verify-full`) y **rechazo de arranque**
+> si falta el certificado con modo seguro. Soporte de CA del servidor de BD vía **`PGSSLROOTCERT`**
+> (§11). Nuevas variables: `POSTGRES_NUM_WRITERS`, `POSTGRES_COMMAND_TIMEOUT_S`,
+> `POSTGRES_SPILL_FSYNC_EVERY`. Spill con **hilo dedicado** (§14.3) y dependencias fijadas por
+> `requirements.lock` + base de imagen por digest.
 
 ---
 
@@ -218,6 +225,10 @@ hostssl  scada_db  connector_user  <IP_HOST_CONECTOR>/32  scram-sha-256
 sudo systemctl reload postgresql
 ```
 
+> El conector necesitará la **CA del servidor** para `verify-full`/`verify-ca`
+> (`PGSSLROOTCERT=/certs/ca.pem`; ver §11). El `docker-compose.yml` monta `./certs` en
+> `/certs:ro` para este fin.
+
 ---
 
 ## 5. Preparación del host del conector
@@ -284,6 +295,8 @@ La imagen resultante tiene:
 - Directorio `/var/lib/connector/spill` con propietario `connector`.
 - `LABEL` OCI con versión, descripción y licencia.
 - `EXPOSE 8000` (métricas + health).
+- Base `python:3.12-slim-bookworm` **fijada por digest** (`@sha256:…`) para builds reproducibles.
+- Dependencias instaladas desde **`requirements.lock`** (versiones exactas resueltas con `pip-compile`).
 
 ### 6.2 Publicar en registro privado
 
@@ -312,15 +325,18 @@ image: registry.fabrica.local/opcua-connector:1.3.0
 
 ```ini
 OPC_SERVER_URL=opc.tcp://plc.fabrica.local:4840
+# Solo aceptable en red aislada/test: emite warning al arrancar.
 OPC_SECURITY_MODE=None
-OPC_SECURITY_POLICY=NoSecurity
 OPC_PUBLISH_INTERVAL_MS=500
 
 POSTGRES_HOST=db.fabrica.local
 POSTGRES_PORT=5432
 POSTGRES_DB=scada_db
 POSTGRES_USER=connector_user
-POSTGRES_SSL_MODE=require
+# Fail-closed por defecto: verify-full verifica CA + hostname (ver §11 para la CA).
+# `require` cifra sin autenticar el servidor y emite warning.
+POSTGRES_SSL_MODE=verify-full
+PGSSLROOTCERT=/certs/ca.pem
 
 POSTGRES_USE_TIMESCALE=true
 POSTGRES_SPILL_ENABLED=true
@@ -349,7 +365,7 @@ docker compose up -d
 
 ```bash
 make logs                          # tail de logs del conector
-curl http://localhost:8001/health  # debe devolver {"status":"ok"}
+curl http://localhost:8001/health  # debe devolver {"status":"healthy", ...} (200)
 curl http://localhost:8001/metrics # métricas Prometheus
 ```
 
@@ -520,28 +536,38 @@ chmod 644 certs/ca.pem
 
 ### 11.2 Configurar el contexto SSL en asyncpg
 
-El conector usa `ssl.create_default_context()` que carga automáticamente el store
-de CA del sistema. Para una CA interna:
+El conector construye el contexto TLS en `connector/db/pool.py::_build_ssl`. Para
+`verify-ca`/`verify-full` carga el store de CA del sistema **y**, si está definida, la CA
+indicada por `PGSSLROOTCERT` (equivalente a libpq). **Opción recomendada** (sin reconstruir
+la imagen):
 
 ```bash
-# Opción A: añadir la CA al store del sistema (dentro del contenedor no es persistente)
-# Opción B: montar ca.pem y configurar PGSSLROOTCERT (pendiente soporte en config.py)
-# Opción C (actual): añadir la CA al bundle del sistema en la imagen
+# 1. Copiar la CA interna al directorio montado en el contenedor
+cp /ruta/a/ca_interna.crt certs/ca.pem
+chmod 644 certs/ca.pem
 ```
 
-Añadir al `Dockerfile` (stage runtime, antes de `USER connector`):
+```ini
+# 2. Indicar la ruta en .env (el docker-compose.yml ya monta ./certs → /certs:ro)
+PGSSLROOTCERT=/certs/ca.pem
+```
+
+> Si `PGSSLROOTCERT` apunta a un fichero inexistente, el conector **falla en cerrado**
+> (`RuntimeError`) y no conecta: no degrada la verificación en silencio.
+
+*Alternativa:* incrustar la CA en el store del sistema dentro de la imagen (a costa de
+reconstruir la imagen cada vez que la CA rote):
 
 ```dockerfile
 COPY certs/ca.pem /usr/local/share/ca-certificates/fabrica-ca.crt
 RUN update-ca-certificates
 ```
 
-> Esta opción incrusta la CA en la imagen. Si la CA rota, hay que reconstruir la imagen.
-
 ### 11.3 Configuración `.env`
 
 ```ini
 POSTGRES_SSL_MODE=verify-full
+PGSSLROOTCERT=/certs/ca.pem     # opcional si la CA ya está en el store del sistema
 ```
 
 ### 11.4 Verificar la cadena SSL
@@ -673,8 +699,8 @@ docker compose up -d
 | `OPC_USERNAME` | No | vacío | Usuario OPC-UA (si requiere auth) |
 | `OPC_PASSWORD` | No | vacío | Contraseña OPC-UA en claro (usar `_FILE`) |
 | `OPC_PASSWORD_FILE` | No | — | Ruta al fichero con la contraseña OPC-UA |
-| `OPC_SECURITY_MODE` | No | `None` | `None` / `Sign` / `SignAndEncrypt` |
-| `OPC_SECURITY_POLICY` | No | `Basic256Sha256` | Política de seguridad OPC-UA |
+| `OPC_SECURITY_MODE` | No | `SignAndEncrypt` | `None` / `Sign` / `SignAndEncrypt` (**fail-closed por defecto**; `None` emite warning) |
+| `OPC_SECURITY_POLICY` | No | `Basic256Sha256` | `Basic256Sha256` / `Aes128_Sha256_RsaOaep` / `Aes256_Sha256_RsaPss` (se rechazan `Basic128Rsa15`/`Basic256`) |
 | `OPC_CERTIFICATE_PATH` | Cond. | — | Obligatorio si `SECURITY_MODE != None` |
 | `OPC_PRIVATE_KEY_PATH` | Cond. | — | Obligatorio si `SECURITY_MODE != None` |
 | `OPC_PUBLISH_INTERVAL_MS` | No | `500` | Intervalo de publicación en ms |
@@ -698,13 +724,16 @@ docker compose up -d
 | `POSTGRES_USER` | ✅ | — | Usuario de aplicación |
 | `POSTGRES_PASSWORD` | ✅ | — | Contraseña (usar `POSTGRES_PASSWORD_FILE`) |
 | `POSTGRES_PASSWORD_FILE` | No | — | Ruta al fichero con la contraseña de BD |
-| `POSTGRES_SSL_MODE` | No | `prefer` | `disable`/`require`/`verify-ca`/`verify-full` |
+| `POSTGRES_SSL_MODE` | No | `verify-full` | `disable`/`allow`/`prefer`/`require`/`verify-ca`/`verify-full` (**fail-closed por defecto**; los modos que no verifican el servidor emiten warning) |
+| `PGSSLROOTCERT` | No | — | Ruta a la CA del servidor de BD (para `verify-ca`/`verify-full` si no está en el store del sistema). Ver §11 |
 | `POSTGRES_CATALOG_TABLE` | No | `opc_tags_catalog` | Tabla de catálogo de tags |
 | `POSTGRES_DATA_TABLE` | No | `opc_raw_values` | Tabla de series de tiempo |
 | `POSTGRES_BATCH_SIZE` | No | `1000` | Filas por COPY batch |
 | `POSTGRES_FLUSH_INTERVAL_MS` | No | `500` | Máximo tiempo entre flushes |
 | `POSTGRES_POOL_MIN` | No | `2` | Conexiones mínimas del pool |
 | `POSTGRES_POOL_MAX` | No | `10` | Conexiones máximas del pool |
+| `POSTGRES_NUM_WRITERS` | No | `2` | Writers COPY en paralelo (1–8). Cada uno consume la misma cola |
+| `POSTGRES_COMMAND_TIMEOUT_S` | No | `15` | Timeout por comando SQL (s). Evita que un flush bloquee la ingesta |
 | `POSTGRES_STATEMENT_CACHE_SIZE` | No | `100` | `0` si se usa pgBouncer transaction mode |
 | `POSTGRES_USE_TIMESCALE` | No | `true` | `false` para PostgreSQL plano |
 
@@ -716,6 +745,12 @@ docker compose up -d
 | `POSTGRES_SPILL_DIR` | No | `/var/lib/connector/spill` | Directorio de spill |
 | `POSTGRES_SPILL_MAX_MB` | No | `1024` | Límite máximo de spill en MB |
 | `POSTGRES_SPILL_SEGMENT_MB` | No | `64` | Tamaño de cada segmento de spill |
+| `POSTGRES_SPILL_FSYNC_EVERY` | No | `100` | `fsync` cada N escrituras (durabilidad vs throughput; `1` = máxima durabilidad, más lento) |
+
+> **Nota (spill con hilo dedicado):** el volcado a disco lo realiza un **hilo worker propio**
+> (batching de hasta 1000 registros por `write` + fsync por lotes). El *callback* de OPC-UA solo
+> encola en memoria, por lo que el spill **nunca bloquea el event loop**; el directorio es `0700`
+> y los segmentos `0600`. Ver §18.1 para el comportamiento ante caída de BD.
 
 ### 14.4 Operación
 
@@ -763,12 +798,20 @@ Métricas clave expuestas:
 
 | Métrica | Descripción |
 |---|---|
-| `opc_values_received_total` | Valores recibidos del servidor OPC-UA |
-| `opc_values_written_total` | Valores escritos en BD |
-| `opc_queue_size` | Tamaño actual de la cola en memoria |
-| `opc_spill_bytes` | Bytes acumulados en spill a disco |
-| `opc_reconnections_total` | Reconexiones al servidor OPC-UA |
-| `db_copy_duration_seconds` | Latencia del COPY a TimescaleDB |
+| `opc_connector_tags_total` | Tags suscritos |
+| `opc_connector_values_received_total` | Valores recibidos del servidor OPC-UA |
+| `opc_connector_values_written_total` | Valores escritos en BD |
+| `opc_connector_values_dropped_total` | Valores descartados por buffer/spill lleno |
+| `opc_connector_queue_size` | Tamaño actual de la cola en memoria |
+| `opc_connector_batch_lag_seconds` | Retraso del lote más antiguo (ts OPC → flush) |
+| `opc_connector_write_latency_seconds` | Latencia del COPY a la BD (histograma) |
+| `opc_connector_db_errors_total` | Errores de escritura en BD |
+| `opc_connector_spill_bytes` | Bytes acumulados en spill a disco |
+| `opc_connector_spill_files` | Nº de segmentos de spill en disco |
+| `opc_connector_spill_written_total` / `..._replayed_total` | Registros volcados / reinyectados desde spill |
+| `opc_connector_spill_dropped_total` | Segmentos de spill descartados por límite de disco |
+| `opc_connector_opc_reconnections_total` | Reconexiones al servidor OPC-UA |
+| `opc_connector_session_status` / `opc_connector_db_status` | Estado OPC (1/0) / BD (1/0) |
 
 ### 15.3 Configurar scrape Prometheus
 
@@ -788,11 +831,11 @@ scrape_configs:
 
 Paneles sugeridos:
 
-1. **Throughput**: `rate(opc_values_written_total[1m])` vs `rate(opc_values_received_total[1m])`
-2. **Cola**: `opc_queue_size` (alerta si > 80% de `OPC_QUEUE_MAX_SIZE`)
-3. **Spill**: `opc_spill_bytes` (alerta si crece sostenidamente)
-4. **Latencia COPY**: histograma de `db_copy_duration_seconds`
-5. **Reconexiones**: `rate(opc_reconnections_total[5m])`
+1. **Throughput**: `rate(opc_connector_values_written_total[1m])` vs `rate(opc_connector_values_received_total[1m])`
+2. **Cola**: `opc_connector_queue_size` (alerta si > 80% de `OPC_QUEUE_MAX_SIZE`)
+3. **Spill**: `opc_connector_spill_bytes` y `opc_connector_spill_dropped_total` (alertar si el primero crece de forma sostenida)
+4. **Latencia COPY / lag**: histograma de `opc_connector_write_latency_seconds` y gauge `opc_connector_batch_lag_seconds`
+5. **Reconexiones**: `rate(opc_connector_opc_reconnections_total[5m])`
 
 ---
 
@@ -891,7 +934,11 @@ Causas habituales y solución:
 |---|---|---|
 | `Variable de entorno obligatoria ausente: OPC_SERVER_URL` | Falta variable en `.env` | Añadir al `.env` |
 | `Variable de entorno obligatoria ausente: POSTGRES_PASSWORD` | Secret no creado | Crear `secrets/postgres_password.txt` |
-| `OPC_CERTIFICATE_PATH y OPC_PRIVATE_KEY_PATH son obligatorios` | `SECURITY_MODE != None` sin certs | Generar certs o poner `OPC_SECURITY_MODE=None` |
+| `OPC_CERTIFICATE_PATH y OPC_PRIVATE_KEY_PATH son obligatorios` | `SECURITY_MODE != None` sin certs | Generar certs o poner `OPC_SECURITY_MODE=None` (solo test) |
+| `OPC_SECURITY_POLICY obsoleta o inválida` | Política no permitida (`Basic128Rsa15`/`Basic256`) | Usar `Basic256Sha256`/`Aes128_Sha256_RsaOaep`/`Aes256_Sha256_RsaPss` |
+| `OPC_DEADBAND_TYPE inválido` | Valor distinto de `None`/`Absolute`/`Percent` | Corregir el valor en `.env` |
+| `POSTGRES_SSL_MODE inválido` | Modo SSL desconocido | Usar `disable`/`allow`/`prefer`/`require`/`verify-ca`/`verify-full` |
+| `PGSSLROOTCERT apunta a un fichero inexistente` | CA no montada o ruta errónea | Montar `certs/ca.pem` o corregir `PGSSLROOTCERT` (§11) |
 | `ConfigError: POSTGRES_BATCH_SIZE debe ser entero` | Valor no numérico en `.env` | Corregir el valor |
 
 ### 17.2 Error de conexión a la base de datos
@@ -915,17 +962,17 @@ docker compose exec connector-01 \
 
 ```bash
 # Ver métricas en tiempo real
-watch -n2 'curl -s http://localhost:8001/metrics | grep opc_values'
+watch -n2 'curl -s http://localhost:8001/metrics | grep opc_connector_values'
 ```
 
 Posibles causas:
 
-- **`opc_values_received_total` no crece**: el servidor OPC-UA no envía cambios. Verificar
-  que los NodeIDs suscritos existen y tienen el namespace correcto (`OPC_NAMESPACE_INDEX`).
-- **`opc_queue_size` crece sin límite**: el writer no puede conectar con BD. Revisar logs
-  de BD (`db_copy_error`).
-- **`opc_spill_bytes` crece**: BD desconectada o lenta; los datos se están acumulando en
-  disco. Normal mientras dure la caída; se reinyectarán al recuperarse.
+- **`opc_connector_values_received_total` no crece**: el servidor OPC-UA no envía cambios.
+  Verificar que los NodeIDs suscritos existen y tienen el namespace correcto (`OPC_NAMESPACE_INDEX`).
+- **`opc_connector_queue_size` crece sin límite**: el writer no puede conectar con BD. Revisar
+  los logs de error del batch writer (`batch_write_failed`).
+- **`opc_connector_spill_bytes` crece**: BD desconectada o lenta; los datos se están acumulando
+  en disco. Normal mientras dure la caída; se reinyectarán al recuperarse.
 
 ### 17.4 Alto uso de CPU o memoria
 
@@ -956,19 +1003,20 @@ xxd secrets/opc_password.txt
 
 ### 18.1 Caída de la base de datos
 
-**Detección:** alerta Prometheus `opc_spill_bytes > 100MB` o `db_connected = 0`.
+**Detección:** alerta Prometheus `opc_connector_spill_bytes > 100MB` o `opc_connector_db_status = 0`.
 
 ```
 Tiempo 0  → BD cae
-          → BatchWriter detecta error de conexión
-          → Cola en memoria se llena → spill a disco en POSTGRES_SPILL_DIR
-          → Logs: {"event": "db_disconnected", "spill_active": true}
+          → BatchWriter detecta el error de conexión (log `batch_write_failed`)
+          → métrica opc_connector_db_status = 0; los lotes se re-encolan
+          → la cola en memoria se llena → spill a disco en POSTGRES_SPILL_DIR
+          → métricas opc_connector_spill_bytes y opc_connector_spill_written_total crecen
 
 Tiempo T  → BD se recupera
-          → Pool asyncpg reconecta automáticamente (backoff exponencial)
-          → BatchWriter reinyecta segmentos de spill en orden
-          → Logs: {"event": "db_reconnected", "spill_bytes_reinjected": N}
-          → opc_spill_bytes vuelve a 0
+          → Pool asyncpg reconecta automáticamente; los lotes vuelven a escribir (log `batch_written`)
+          → el worker de spill reinyecta segmentos en orden FIFO
+          → métrica opc_connector_spill_replayed_total crece
+          → opc_connector_spill_bytes vuelve a 0
 ```
 
 **Acción operativa:**
@@ -982,7 +1030,7 @@ Tiempo T  → BD se recupera
 
 ### 18.2 Saturación de la cola en memoria
 
-**Detección:** `opc_queue_size / OPC_QUEUE_MAX_SIZE > 0.8` durante > 60 s.
+**Detección:** `opc_connector_queue_size / OPC_QUEUE_MAX_SIZE > 0.8` durante > 60 s.
 
 **Causas:** tasa de ingesta > capacidad de escritura en BD, o BD lenta.
 
@@ -994,7 +1042,7 @@ Tiempo T  → BD se recupera
 
 ### 18.3 Reconexiones frecuentes al servidor OPC-UA
 
-**Detección:** `rate(opc_reconnections_total[5m]) > 1`.
+**Detección:** `rate(opc_connector_opc_reconnections_total[5m]) > 1`.
 
 **Acción:**
 1. Verificar conectividad de red: `ping plc.fabrica.local` desde el host del conector.
@@ -1034,7 +1082,7 @@ docker compose restart
 docker compose exec connector-01 du -sh /var/lib/connector/spill/
 
 # 2. Si la BD está activa, el spill debería drenarse solo.
-#    Esperar a que opc_spill_bytes vuelva a 0.
+#    Esperar a que opc_connector_spill_bytes vuelva a 0.
 
 # 3. Si la BD no está disponible, decidir si se puede tolerar pérdida de datos:
 #    Limpiar manualmente solo si se acepta la pérdida:
@@ -1043,4 +1091,4 @@ docker compose exec connector-01 rm -rf /var/lib/connector/spill/<CONNECTOR_ID>/
 
 ---
 
-*Fin del documento — Manual de Implantación Conector OPC-UA v1.0*
+*Fin del documento — Manual de Implantación Conector OPC-UA v1.1*
