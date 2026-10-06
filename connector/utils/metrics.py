@@ -17,6 +17,8 @@ VALUES_WRITTEN = Counter("opc_connector_values_written_total", "Valores escritos
 VALUES_DROPPED = Counter("opc_connector_values_dropped_total", "Valores descartados por buffer lleno")
 QUEUE_SIZE = Gauge("opc_connector_queue_size", "Tamaño actual del buffer en memoria")
 WRITE_LATENCY = Histogram("opc_connector_write_latency_seconds", "Latencia de escritura por lote en BD")
+# P0: lag entre SourceTimestamp más antiguo del lote y flush (detecta backlog).
+BATCH_LAG = Gauge("opc_connector_batch_lag_seconds", "Retraso del lote más antiguo (ts más viejo → flush)")
 DB_ERRORS = Counter("opc_connector_db_errors_total", "Errores de escritura en BD")
 OPC_RECONNECTIONS = Counter("opc_connector_opc_reconnections_total", "Reconexiones al servidor OPC-UA")
 SESSION_STATUS = Gauge("opc_connector_session_status", "Estado sesión OPC-UA (1=ok, 0=ko)")

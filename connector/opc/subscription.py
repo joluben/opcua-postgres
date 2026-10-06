@@ -22,6 +22,36 @@ from .browser import Tag
 log = get_logger(__name__)
 
 _QUEUE_SIZE_SERVER = 100
+# P0: trocear createMonitoredItems para no superar MaxMonitoredItems/PDU del servidor.
+_SUBSCRIBE_CHUNK_SIZE = 1000
+
+
+def build_datachange_filter(cfg: OpcConfig):  # noqa: ANN001, ANN202
+    """Construye el DataChangeFilter a partir de OPC_DEADBAND_TYPE/VALUE.
+
+    P0: antes ``deadband`` se parseaba pero nunca se usaba (tráfico 10-100x).
+    - ``None`` o valor <= 0 → sin filtro (comportamiento anterior).
+    - ``Absolute``/``Percent`` → filtro UA con DeadbandValue.
+    Devuelve None si la versión de asyncua no expone la API.
+    """
+    dtype = (cfg.deadband_type or "None").strip()
+    if dtype == "None" or cfg.deadband <= 0:
+        return None
+    try:
+        deadband_type = getattr(ua.DeadbandType, dtype, None)
+        if deadband_type is None:
+            # Algunas versiones usan None_ para el valor 0.
+            deadband_type = getattr(ua.DeadbandType, dtype.rstrip("_"), None)
+        filt_cls = getattr(ua, "DataChangeFilter", None)
+        trigger = getattr(getattr(ua, "DataChangeTrigger", object), "StatusValue", 1)
+        if filt_cls is None or deadband_type is None:
+            log.warning("opc_deadband_unsupported", deadband_type=dtype)
+            return None
+        return filt_cls(Trigger=trigger, DeadbandType=deadband_type,
+                        DeadbandValue=float(cfg.deadband))
+    except Exception as exc:  # noqa: BLE001
+        log.warning("opc_deadband_build_failed", error=str(exc), deadband_type=dtype)
+        return None
 
 
 class SubHandler:
@@ -73,18 +103,29 @@ async def subscribe(
     connector_id: str,
     spill: SpillBuffer | None = None,
 ):
-    """Crea la suscripción y registra los MonitoredItems de la partición local."""
+    """Crea la suscripción y registra los MonitoredItems de la partición local.
+
+    P0: suscribe por bloques de 1000 nodos y aplica DataChangeFilter (deadband).
+    """
     node_to_tag = {t.node.nodeid: t.tag_id for t in tags}
     handler = SubHandler(queue, node_to_tag, connector_id, spill)
 
     subscription = await client.create_subscription(cfg.publish_interval_ms, handler)
 
     nodes = [t.node for t in tags]
+    datachange_filter = build_datachange_filter(cfg)
     if nodes:
-        await subscription.subscribe_data_change(
-            nodes,
-            queuesize=_QUEUE_SIZE_SERVER,
-            sampling_interval=cfg.publish_interval_ms,
-        )
-    log.info("opc_subscribed", monitored_items=len(nodes), publish_interval_ms=cfg.publish_interval_ms)
+        # Trocear para no saturar una sola petición CreateMonitoredItems.
+        for start in range(0, len(nodes), _SUBSCRIBE_CHUNK_SIZE):
+            chunk = nodes[start:start + _SUBSCRIBE_CHUNK_SIZE]
+            kwargs = dict(queuesize=_QUEUE_SIZE_SERVER,
+                          sampling_interval=cfg.publish_interval_ms)
+            if datachange_filter is not None:
+                kwargs["filter"] = datachange_filter
+            await subscription.subscribe_data_change(chunk, **kwargs)
+    log.info("opc_subscribed", monitored_items=len(nodes),
+             publish_interval_ms=cfg.publish_interval_ms,
+             deadband_type=cfg.deadband_type, deadband=cfg.deadband,
+             chunks=(len(nodes) + _SUBSCRIBE_CHUNK_SIZE - 1) // _SUBSCRIBE_CHUNK_SIZE
+             if nodes else 0)
     return subscription
