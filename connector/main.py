@@ -12,6 +12,7 @@ Orquesta:
 from __future__ import annotations
 
 import asyncio
+import os
 import signal
 
 from .config import Config
@@ -39,8 +40,12 @@ async def _run_opc_session(
     try:
         await initialize_schema(pool, cfg.db)
 
-        writer = BatchWriter(pool, cfg.db, queue, spill)
-        writer_task = asyncio.create_task(writer.run(), name="batch-writer")
+        # P0: N writers COPY en paralelo (default 2). Solo worker 0 reinyecta spill.
+        num_writers = max(1, min(8, int(getattr(cfg.db, "num_writers", 2))))
+        writers = [BatchWriter(pool, cfg.db, queue, spill, worker_id=i)
+                   for i in range(num_writers)]
+        writer_tasks = [asyncio.create_task(w.run(), name=f"batch-writer-{i}")
+                        for i, w in enumerate(writers)]
 
         client = await retry_async(
             lambda: opc_client.connect(cfg.opc),
@@ -63,8 +68,9 @@ async def _run_opc_session(
                 await client.disconnect()
             except Exception as exc:  # noqa: BLE001
                 log.warning("opc_disconnect_error", error=str(exc))
-            writer.stop()
-            await writer_task
+            for w in writers:
+                w.stop()
+            await asyncio.gather(*writer_tasks, return_exceptions=True)
     finally:
         await pool.close()
         health.db_connected = False
@@ -85,7 +91,9 @@ async def _wait_until_disconnected(client) -> None:  # noqa: ANN001
 async def main() -> None:
     cfg = Config.from_env()
     configure_logging(cfg.log_level, cfg.log_format, cfg.connector_id)
-    log.info("connector_start", version="1.1.0", db_host=cfg.db.host, opc_url=cfg.opc.server_url)
+    # P0: versión única desde build-arg (ENV VERSION) sin divergencia con main.
+    version = os.getenv("VERSION", os.getenv("CONNECTOR_VERSION", "dev"))
+    log.info("connector_start", version=version, db_host=cfg.db.host, opc_url=cfg.opc.server_url)
 
     health = metrics.HealthState()
     runner = await metrics.start_http_server(cfg.metrics_port, health)

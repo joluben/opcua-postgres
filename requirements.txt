@@ -1,15 +1,25 @@
-# OPC-UA client (asyncio). La serie 0.9.x está obsoleta; usar 1.1.x/2.0
-asyncua>=1.1,<3.0
+# P0: rangos acotados (compatible-release) para evitar instalar versiones
+# vulnerables por defecto. Generar requirements.lock con:
+#   pip-compile --generate-hashes requirements.txt -o requirements.lock
+# y auditar con `pip-audit` en CI.
+#
+# OPC-UA client (asyncio). 2.0.x requiere Python >=3.10.
+# Fijado a 2.0.x (parcheado contra DoS de chunks PYSEC-2026-2385).
+asyncua~=2.0.1
 
-# PostgreSQL async driver (alto rendimiento, COPY)
-# 0.29.x → PG 9.5–16 | 0.30.x → PG 17 | 0.31.x → PG 17–18
-asyncpg>=0.30,<0.32
+# PostgreSQL async driver (alto rendimiento, COPY). 0.31.x → PG 17–18.
+asyncpg~=0.31.0
 
-# Logging estructurado JSON
-structlog>=24.1
+# Logging estructurado JSON.
+structlog~=25.4.0
 
-# Métricas Prometheus
-prometheus_client>=0.20
+# Métricas Prometheus.
+prometheus_client~=0.22.0
 
-# Servidor HTTP ligero para /health y /metrics
-aiohttp>=3.9
+# Servidor HTTP ligero para /health y /metrics.
+# P0: >=3.13.3 obligatorio (CVE request-smuggling/DoS 2025-2026),
+# 3.14.x parchea zip-bomb CVE-2026-54278 y smuggling WebSocket.
+aiohttp~=3.14.2
+
+# Serialización rápida para spill a disco (con fallback a json stdlib).
+orjson>=3.10,<4.0

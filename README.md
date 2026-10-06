@@ -13,7 +13,13 @@ múltiples instancias, cada una responsable de una partición de tags.
 >
 > **Durabilidad:** el buffer en memoria hace **spill a disco** (`POSTGRES_SPILL_*`) cuando se
 > llena, de modo que **no se pierden datos** ante caídas largas de la BD; se reinyectan al
-> recuperarse. El directorio de spill debe estar en un **volumen persistente**.
+> recuperarse. El directorio de spill debe estar en un **volumen persistente**. El spill se
+> gestiona en un **hilo dedicado** (batching + fsync), de forma que **nunca bloquea el event loop**.
+
+> **Seguridad (fail-closed):** por defecto el conector exige `OPC_SECURITY_MODE=SignAndEncrypt`
+> y `POSTGRES_SSL_MODE=verify-full`, y **rechaza el arranque** si falta el certificado/clave.
+> Los modos inseguros (`None`, `disable`, `prefer`, `allow`, `require`) solo se aceptan de forma
+> explícita y **generan warning**.
 
 Plan técnico completo: [`docs/plan_implementacion_conector_opcua.md`](docs/plan_implementacion_conector_opcua.md).
 
@@ -32,30 +38,32 @@ OPC-UA Server ──(DataChange)──▶ Conector(es) Docker ──(TCP 5432 / 
 ## Estructura del proyecto
 
 ```
-opcua-postgres/
+./
 ├── connector/
 │   ├── main.py              # Orquestación y reconexión
-│   ├── config.py            # Carga/validación de variables de entorno (+ Docker Secrets *_FILE)
+│   ├── config.py            # Carga/validación fail-closed (+ Docker Secrets *_FILE)
 │   ├── opc/
 │   │   ├── client.py        # Sesión OPC-UA
-│   │   ├── security.py      # Políticas y certificados X.509
+│   │   ├── security.py      # Políticas y certificados X.509 (allow-list)
 │   │   ├── browser.py       # Descubrimiento + partición vía catálogo
-│   │   └── subscription.py  # DataChange → asyncio.Queue
+│   │   └── subscription.py  # DataChange → asyncio.Queue (chunks de 1000 + deadband)
 │   ├── db/
-│   │   ├── pool.py          # Pool asyncpg (SSL, statement_cache para pgBouncer)
+│   │   ├── pool.py          # Pool asyncpg (SSL, CA vía PGSSLROOTCERT, statement_cache)
 │   │   ├── initializer.py   # Creación idempotente de tablas/hypertable + verificación de permisos
-│   │   └── writer.py        # Batch writer con COPY + drop-oldest
+│   │   ├── writer.py        # Batch writer multi-COPY + requeue + métrica de lag
+│   │   └── spill.py         # Spill a disco con hilo dedicado (batching + fsync)
 │   └── utils/
 │       ├── logger.py        # structlog (JSON)
 │       ├── metrics.py       # Prometheus + /health (aiohttp)
 │       └── resilience.py    # Backoff exponencial con jitter
 ├── scripts/dba_setup.sql    # Aprovisionamiento del servidor de BD (ejecuta el DBA)
-├── tests/                   # test_security.py, test_browser.py, test_writer.py
-├── Dockerfile               # Multi-stage, usuario no-root
+├── tests/                   # test_security, test_browser, test_writer, test_spill, test_pool
+├── Dockerfile               # Multi-stage, usuario no-root, base fijada por digest
 ├── docker-compose.yml       # Un conector (BD remota)
 ├── docker-compose.scale.yml # Varios conectores en paralelo
 ├── .env.example
-└── requirements.txt
+├── requirements.txt         # Dependencias directas (rangos acotados)
+└── requirements.lock        # Versiones exactas resueltas (pip-compile) para builds reproducibles
 ```
 
 ---
@@ -137,15 +145,29 @@ curl http://localhost:8001/health
 curl http://localhost:8001/metrics
 ```
 
+Métricas clave:
+
+| Métrica | Descripción |
+|---|---|
+| `opc_connector_values_received_total` / `..._written_total` | Valores recibidos / escritos (comparar para detectar backlog) |
+| `opc_connector_queue_size` | Tamaño actual del buffer en memoria |
+| `opc_connector_batch_lag_seconds` | Retraso del lote más antiguo (ts OPC → flush) |
+| `opc_connector_write_latency_seconds` | Latencia del COPY por lote |
+| `opc_connector_spill_bytes` / `..._files` | Bytes y nº de segmentos de spill en disco |
+| `opc_connector_spill_written_total` / `..._replayed_total` | Registros volcados / reinyectados desde spill |
+| `opc_connector_spill_dropped_total` / `values_dropped_total` | Pérdida por spill lleno / buffer lleno |
+| `opc_connector_session_status` / `opc_connector_db_status` | Estado OPC (1/0) y BD (1/0) |
+
 ## Tests
 
 ```bash
-pip install -r requirements.txt pytest
+pip install -r requirements.lock pytest
 pytest -q
 ```
 
-Los tests incluidos no requieren servidor OPC-UA ni BD (validan configuración, filtros de
-browse y la política drop-oldest del writer).
+21 tests que **no requieren** servidor OPC-UA ni BD: validan la configuración fail-closed,
+las políticas SSL (`_build_ssl` y CA vía `PGSSLROOTCERT`), los filtros de browse, el
+roundtrip/parcial/drop-oldest del spill y la política de requeue del writer.
 
 ---
 
@@ -164,7 +186,7 @@ browse y la política drop-oldest del writer).
 |---|---|---|
 | `/health` 503 con `db_connected=false` | BD remota o red caída | Revisar `POSTGRES_HOST`/firewall/SSL; el buffer absorbe hasta `OPC_QUEUE_MAX_SIZE`; al recuperar, se vacía solo |
 | `opc_connector_spill_bytes` crece | BD caída: el buffer se está volcando a disco | Normal y esperado; los datos se reinyectan al recuperar la BD. Vigilar espacio en disco del volumen de spill |
-| `opc_connector_spill_dropped_total` o `values_dropped_total` crecen | Spill lleno (`POSTGRES_SPILL_MAX_MB`) o spill deshabilitado | Ampliar `POSTGRES_SPILL_MAX_MB`/disco, o `OPC_QUEUE_MAX_SIZE`; definir SLA de pérdida |
+| `opc_connector_spill_dropped_total` o `opc_connector_values_dropped_total` crecen | Spill lleno (`POSTGRES_SPILL_MAX_MB`) o spill deshabilitado | Ampliar `POSTGRES_SPILL_MAX_MB`/disco, o `OPC_QUEUE_MAX_SIZE`; definir SLA de pérdida |
 | `/health` 503 con `opc_connected=false` | Sesión OPC-UA perdida | El conector reconecta con backoff; revisar red/`MaxSessionCount` |
 | Arranque falla: *extensión TimescaleDB no instalada* | DBA no ejecutó `dba_setup.sql` | Ejecutar el script en la BD remota |
 | Arranque falla: *permiso insuficiente* | Falta `INSERT`/`UPDATE` | Revisar `GRANT` (§8.2 del plan / `dba_setup.sql`) |
@@ -180,6 +202,11 @@ browse y la política drop-oldest del writer).
 
 ### Seguridad
 - `.env`, `secrets/` y `certs/` nunca se commitean.
-- BD con `POSTGRES_SSL_MODE=require` en producción.
-- Contenedor sin root; usuario de BD con permisos mínimos.
+- **Fail-closed por defecto:** `OPC_SECURITY_MODE=SignAndEncrypt` y `POSTGRES_SSL_MODE=verify-full`.
+  Con modo seguro, el conector **no arranca** si faltan `OPC_CERTIFICATE_PATH`/`OPC_PRIVATE_KEY_PATH`.
+- BD con `POSTGRES_SSL_MODE=verify-full` + CA montada (`PGSSLROOTCERT`, en el compose `/certs/ca.pem`).
+  `require`/`prefer`/`allow`/`disable` cifran sin verificar el servidor y **generan warning**.
+- Políticas OPC-UA admitidas: `Basic256Sha256`, `Aes128_Sha256_RsaOaep`, `Aes256_Sha256_RsaPss`
+  (se rechazan las obsoletas `Basic128Rsa15`/`Basic256`).
+- Contenedor sin root; usuario de BD con permisos mínimos; spill en disco con permisos `0700`/`0600`.
 - Nunca loggear variables de entorno completas ni valores de proceso.

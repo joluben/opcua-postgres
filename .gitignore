@@ -41,7 +41,8 @@ Thumbs.db
 logs/
 
 # ── Documentación ─────────────────────────────────────────────────────────────
-docs/*
 docs/
+docs/manual_implantacion.md
+docs/plan_implementacion_conector_opcua.md
 
 .agents/*

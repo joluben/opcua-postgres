@@ -1,6 +1,6 @@
 # ============================================================================
 # .dockerignore — Contexto de build para la imagen de producción del conector.
-# Solo entra en la imagen: connector/, requirements.txt, Dockerfile.
+# Solo entra en la imagen: connector/, requirements.txt, requirements.lock, Dockerfile.
 # ============================================================================
 
 # ── Artefactos de prueba y desarrollo ────────────────────────────────────────
