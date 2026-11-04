@@ -25,7 +25,7 @@ else
 FULL_IMAGE := $(IMAGE):$(VERSION)
 endif
 
-.PHONY: build push run up down test logs ps clean help
+.PHONY: build push run up down test test-down acceptance monitoring-up monitoring-down logs ps clean help
 
 ## build — construye la imagen con ARG VERSION incrustado en los LABEL OCI
 build:
@@ -71,6 +71,19 @@ test:
 ## test-down — para el pipeline de pruebas y limpia volúmenes
 test-down:
 	docker compose -f docker-compose.test.yml down -v
+
+## acceptance — prueba de aceptación con PostgreSQL real y rol restringido
+acceptance:
+	./scripts/acceptance_pg.sh
+
+## monitoring-up — levanta Prometheus + Grafana (stack opcional)
+monitoring-up:
+	docker compose -f docker-compose.monitoring.yml up -d
+	@echo "Prometheus: http://localhost:9090  Grafana: http://localhost:3000"
+
+## monitoring-down — para el stack de monitorización (conserva volúmenes)
+monitoring-down:
+	docker compose -f docker-compose.monitoring.yml down
 
 ## logs — tail de logs del conector (producción)
 logs:

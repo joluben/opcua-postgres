@@ -1,0 +1,205 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        { "expr": "sum(up{job=\"opcua_connectors\"})", "legendFormat": "targets UP", "refId": "A" }
+      ],
+      "title": "Conectores UP",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "color": "red", "text": "DOWN" }, "1": { "color": "green", "text": "UP" } }, "type": "value" }
+          ],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        { "expr": "min(opc_connector_db_status)", "legendFormat": "PostgreSQL", "refId": "A" }
+      ],
+      "title": "BD",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "color": "red", "text": "DOWN" }, "1": { "color": "green", "text": "UP" } }, "type": "value" }
+          ],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 0 },
+      "id": 3,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        { "expr": "min(opc_connector_session_status)", "legendFormat": "OPC-UA", "refId": "A" }
+      ],
+      "title": "Sesión OPC-UA",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "options": { "0": { "color": "orange", "text": "DISABLED" }, "1": { "color": "green", "text": "ENABLED" } }, "type": "value" }
+          ],
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 0 },
+      "id": 4,
+      "options": {
+        "colorMode": "background",
+        "graphMode": "none",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "textMode": "auto"
+      },
+      "targets": [
+        { "expr": "min(opc_connector_dedup_enabled)", "legendFormat": "Dedup", "refId": "A" }
+      ],
+      "title": "Deduplicación",
+      "type": "stat"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "id": 5,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "sum by (instance) (rate(opc_connector_values_received_total[1m]))", "legendFormat": "recibidos {{instance}}", "refId": "A" },
+        { "expr": "sum by (instance) (rate(opc_connector_values_written_total[1m]))", "legendFormat": "escritos {{instance}}", "refId": "B" }
+      ],
+      "title": "Throughput (valores/s)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "max": 1, "min": 0 }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "id": 6,
+      "options": { "legend": { "displayMode": "list", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "opc_connector_queue_size / clamp_min(opc_connector_queue_capacity, 1)",
+          "legendFormat": "cola {{instance}}",
+          "refId": "A"
+        }
+      ],
+      "title": "Ocupación de la cola en memoria",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "bytes" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "id": 7,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "opc_connector_spill_bytes", "legendFormat": "spill {{instance}}", "refId": "A" },
+        { "expr": "opc_connector_spill_capacity_bytes", "legendFormat": "límite {{instance}}", "refId": "B" }
+      ],
+      "title": "Spill en disco",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "id": 8,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "opc_connector_batch_lag_seconds", "legendFormat": "lag {{instance}}", "refId": "A" },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, instance) (rate(opc_connector_write_latency_seconds_bucket[5m])))",
+          "legendFormat": "p95 escritura {{instance}}",
+          "refId": "B"
+        }
+      ],
+      "title": "Lag y latencia de escritura",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "ops" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "id": 9,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "rate(opc_connector_values_duplicates_total[1m])", "legendFormat": "duplicados {{instance}}", "refId": "A" },
+        { "expr": "rate(opc_connector_spill_replayed_total[1m])", "legendFormat": "replay {{instance}}", "refId": "B" },
+        { "expr": "rate(opc_connector_spill_acked_total[1m])", "legendFormat": "ack {{instance}}", "refId": "C" }
+      ],
+      "title": "Integridad: duplicados / replay / ACK",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "id": 10,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "increase(opc_connector_values_dropped_total[5m])", "legendFormat": "valores perdidos {{instance}}", "refId": "A" },
+        { "expr": "increase(opc_connector_spill_dropped_total[5m])", "legendFormat": "segmentos perdidos {{instance}}", "refId": "B" },
+        { "expr": "increase(opc_connector_spill_drain_timeouts_total[5m])", "legendFormat": "timeouts drain {{instance}}", "refId": "C" },
+        { "expr": "increase(opc_connector_opc_reconnections_total[5m])", "legendFormat": "reconexiones {{instance}}", "refId": "D" }
+      ],
+      "title": "Pérdidas y eventos operativos (5m)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 39,
+  "tags": ["opcua", "connector", "timescaledb"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "OPC-UA Connector",
+  "uid": "opcua-connector",
+  "version": 1
+}

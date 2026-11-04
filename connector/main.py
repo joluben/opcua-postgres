@@ -140,6 +140,13 @@ async def main() -> None:
     health = metrics.HealthState()
     runner = await metrics.start_http_server(cfg.metrics_port, health)
 
+    # Capacidad expuesta para que las alertas calculen ocupación relativa.
+    try:
+        metrics.QUEUE_CAPACITY.set(cfg.opc.queue_max_size)
+        metrics.DEDUP_ENABLED.set(1 if cfg.db.dedup_enabled else 0)
+    except Exception:  # noqa: BLE001
+        pass
+
     queue: asyncio.Queue = asyncio.Queue(maxsize=cfg.opc.queue_max_size)
     spill = SpillBuffer(cfg.db, cfg.connector_id)
 

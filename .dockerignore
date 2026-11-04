@@ -12,6 +12,7 @@ docker-compose.test.yml
 
 # ── Documentación (no necesaria en runtime) ───────────────────────────────────
 docs/
+monitoring/
 *.md
 !README.md
 

@@ -1,0 +1,28 @@
+# ============================================================================
+# Normalización de finales de línea
+# ----------------------------------------------------------------------------
+# El conector se ejecuta en contenedores Linux: se normaliza a LF tanto en el
+# repositorio como en el checkout, sin importar el sistema del desarrollador.
+# Evita los avisos "LF will be replaced by CRLF" y, más importante, que los
+# scripts entren con CRLF y fallen dentro del contenedor.
+# ============================================================================
+* text=auto eol=lf
+
+# Scripts y ficheros que deben ser LF sí o sí
+*.sh       text eol=lf
+Dockerfile text eol=lf
+Makefile   text eol=lf
+
+# Binarios: no aplicar conversión
+*.png   binary
+*.jpg   binary
+*.jpeg  binary
+*.gif   binary
+*.ico   binary
+*.pem   binary
+*.der   binary
+*.key   binary
+*.pfx   binary
+*.p12   binary
+*.woff  binary
+*.woff2 binary

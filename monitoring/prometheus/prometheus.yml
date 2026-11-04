@@ -1,0 +1,24 @@
+# Prometheus para el conector OPC-UA.
+#
+# En el stack de monitorización (docker-compose.monitoring.yml) los conectores
+# publican sus métricas en el host (8001, 8002, ...), por eso se usa
+# host.docker.internal. Si Prometheus corre en la misma red Docker que los
+# conectores, sustituir por `connector-01:8000`, `connector-02:8000`, etc.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+scrape_configs:
+  - job_name: opcua_connectors
+    metrics_path: /metrics
+    static_configs:
+      - targets:
+          - "host.docker.internal:8001"   # connector-01
+          # - "host.docker.internal:8002" # connector-02 (docker-compose.scale.yml)
+          # - "host.docker.internal:8003" # connector-03
+        labels:
+          environment: production

@@ -20,6 +20,10 @@ VALUES_DUPLICATES = Counter(
     "Valores deduplicados por la clave única (ON CONFLICT DO NOTHING)",
 )
 QUEUE_SIZE = Gauge("opc_connector_queue_size", "Tamaño actual del buffer en memoria")
+QUEUE_CAPACITY = Gauge(
+    "opc_connector_queue_capacity",
+    "Capacidad máxima del buffer en memoria (OPC_QUEUE_MAX_SIZE)",
+)
 WRITE_LATENCY = Histogram("opc_connector_write_latency_seconds", "Latencia de escritura por lote en BD")
 # P0: lag entre SourceTimestamp más antiguo del lote y flush (detecta backlog).
 BATCH_LAG = Gauge("opc_connector_batch_lag_seconds", "Retraso del lote más antiguo (ts más viejo → flush)")
@@ -39,6 +43,14 @@ SPILL_DRAIN_TIMEOUTS = Counter(
 )
 SPILL_BYTES = Gauge("opc_connector_spill_bytes", "Bytes actuales en el buffer de spill en disco")
 SPILL_FILES = Gauge("opc_connector_spill_files", "Número de segmentos de spill en disco")
+SPILL_CAPACITY_BYTES = Gauge(
+    "opc_connector_spill_capacity_bytes",
+    "Límite configurado del spill en bytes (0 si está deshabilitado)",
+)
+DEDUP_ENABLED = Gauge(
+    "opc_connector_dedup_enabled",
+    "Deduplicación idempotente activa (1) o desactivada (0)",
+)
 
 
 class HealthState:

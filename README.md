@@ -150,16 +150,31 @@ Métricas clave:
 | Métrica | Descripción |
 |---|---|
 | `opc_connector_values_received_total` / `..._written_total` | Valores recibidos / escritos (comparar para detectar backlog) |
-| `opc_connector_queue_size` | Tamaño actual del buffer en memoria |
+| `opc_connector_queue_size` / `..._capacity` | Tamaño actual y capacidad del buffer en memoria |
 | `opc_connector_batch_lag_seconds` | Retraso del lote más antiguo (ts OPC → flush) |
 | `opc_connector_write_latency_seconds` | Latencia del COPY por lote |
-| `opc_connector_spill_bytes` / `..._files` | Bytes y nº de segmentos de spill en disco |
+| `opc_connector_spill_bytes` / `..._files` / `..._capacity_bytes` | Bytes, nº de segmentos y límite del spill en disco |
 | `opc_connector_spill_written_total` / `..._replayed_total` | Registros volcados / reinyectados desde spill |
 | `opc_connector_spill_dropped_total` / `values_dropped_total` | Pérdida por spill lleno / buffer lleno |
 | `opc_connector_spill_acked_total` | Lotes de spill confirmados tras el commit en BD |
 | `opc_connector_spill_drain_timeouts_total` | Timeouts del drain (no implican pérdida: se reintenta) |
 | `opc_connector_values_duplicates_total` | Filas deduplicadas por `ON CONFLICT DO NOTHING` |
+| `opc_connector_dedup_enabled` | Deduplicación activa (1/0) |
 | `opc_connector_session_status` / `opc_connector_db_status` | Estado OPC (1/0) y BD (1/0) |
+
+### Prometheus + Grafana
+
+El directorio [`monitoring/`](monitoring/) incluye Prometheus, alertas y un
+dashboard Grafana provisionado:
+
+```bash
+GRAFANA_ADMIN_PASSWORD='cambiar-esto' \
+  docker compose -f docker-compose.monitoring.yml up -d
+# Prometheus: http://localhost:9090  ·  Grafana: http://localhost:3000
+```
+
+Las alertas cubren conectividad, cola, spill, lag, latencia, pérdidas,
+deduplicación y reconexiones. Ver [`monitoring/README.md`](monitoring/README.md).
 
 ## Tests
 
@@ -168,10 +183,22 @@ pip install -r requirements.lock pytest
 pytest -q
 ```
 
-40 tests que **no requieren** servidor OPC-UA ni BD: validan la configuración fail-closed,
+44 tests que **no requieren** servidor OPC-UA ni BD: validan la configuración fail-closed,
 las políticas SSL (`_build_ssl` y CA vía `PGSSLROOTCERT`), los filtros de browse, el
 roundtrip/ACK/reinicio del spill, la compatibilidad con líneas legacy de 6 campos, la
 inserción idempotente (`ON CONFLICT`) y la política de requeue del writer.
+
+Prueba de aceptación con PostgreSQL/TimescaleDB real y rol restringido
+(`connector_user` sin superusuario):
+
+```bash
+make acceptance
+# equivale a: ./scripts/acceptance_pg.sh
+```
+
+Requiere Docker. Levanta un contenedor efímero, aplica `scripts/dba_setup.sql`,
+ejecuta `initialize_schema` como `connector_user` y valida que el replay tras un
+crash no duplica filas. En CI se ejecuta en el job `integration`.
 
 ---
 
@@ -197,6 +224,49 @@ inserción idempotente (`ON CONFLICT`) y la política de requeue del writer.
 | Arranque falla: *permission denied for schema public* | Falta `CREATE` en el schema (PostgreSQL 15+) | Ejecutar `GRANT USAGE, CREATE ON SCHEMA public TO connector_user;` |
 | Tags duplicados/huecos entre conectores | Particionamiento no coordinado | Asegurar partición por catálogo (`node_id`), no por browse ad-hoc |
 | Latencia de escritura alta | Chunks grandes / BD subdimensionada | Revisar tuning (§15.2), chunk de 15 min, recursos del host de BD |
+
+### Apagado ordenado
+
+1. Docker envía `SIGTERM`; el conector activa `stop_event`, desconecta OPC y
+   detiene los writers.
+2. El lote local intenta un último insert; el resto de la cola se persiste en el
+   spill. Después se cierra el pool.
+3. El proceso debe terminar dentro de `SHUTDOWN_TIMEOUT_S` (30 s por defecto),
+   menor que `stop_grace_period` del contenedor (45 s).
+4. Verificar en logs `shutdown_requested` → `connector_stop` y que no aparecen
+   `spill_close_timeout` ni `max_retries_reached`.
+
+```bash
+docker compose stop connector-01
+docker compose logs --tail=50 connector-01
+```
+
+Si el contenedor recibe `SIGKILL`, el spill no confirmado se reintenta al
+arrancar; la clave `event_id` evita duplicados.
+
+### Rollback de versión
+
+El conector anterior a la Fase 2 **no entiende** las líneas de spill de 7 campos
+(con `event_id`). Antes de bajar de versión:
+
+```bash
+# 1. Arrancar la versión nueva con la BD sana y esperar a que el spill drene:
+watch -n2 'curl -s http://localhost:8001/metrics | grep opc_connector_spill_bytes'
+# opc_connector_spill_bytes debe llegar a 0.
+
+# 2. Parar el conector.
+docker compose stop connector-01
+
+# 3. Verificar que no quedan segmentos pendientes:
+docker compose run --rm --entrypoint sh connector-01 \
+  -c 'ls -la /var/lib/connector/spill/*/*.jsonl 2>/dev/null || echo "spill vacío"'
+```
+
+Si no se puede drenar, exportar/reprocesar el spill con la versión nueva antes
+de desplegar la antigua; no borrar segmentos sin aceptar pérdida de datos.
+La migración de schema (`event_id` + índice) es compatible hacia atrás: la
+versión antigua inserta `event_id=NULL`. Si se desactiva
+`POSTGRES_DEDUP_ENABLED`, el índice no se crea en arranques nuevos.
 
 ### Mantenimiento
 - **Certificados OPC-UA:** validez recomendada ≤ 3 años. Alertar 30 días antes del vencimiento.

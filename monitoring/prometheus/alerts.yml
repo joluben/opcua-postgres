@@ -1,0 +1,183 @@
+# Alertas de producción del conector OPC-UA.
+#
+# Supuestos:
+# - `opc_connector_queue_capacity` y `opc_connector_spill_capacity_bytes` las
+#   expone el propio conector.
+# - Cada conector es un target del job `opcua_connectors`.
+#
+# Ajustar los umbrales al SLA acordado antes de desplegar.
+
+groups:
+  - name: opcua-connector-disponibilidad
+    interval: 30s
+    rules:
+      - alert: OpcConnectorTargetDown
+        expr: up{job="opcua_connectors"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Conector OPC-UA no scrapeable ({{ $labels.instance }})"
+          description: >-
+            Prometheus no puede leer /metrics. El contenedor está caído, el
+            puerto no responde o el healthcheck ha fallado.
+
+      - alert: OpcConnectorDbDown
+        expr: opc_connector_db_status == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Conector sin conexión a PostgreSQL ({{ $labels.instance }})"
+          description: >-
+            Los datos se acumulan en memoria y, si persiste, en el spill de
+            disco. Revisar red/BD y el log `batch_write_failed`.
+
+      - alert: OpcConnectorOpcDown
+        expr: opc_connector_session_status == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Sesión OPC-UA perdida ({{ $labels.instance }})"
+          description: >-
+            El conector está reintentando la conexión OPC-UA. Revisar red,
+            certificados y límites de sesión del servidor.
+
+  - name: opcua-connector-buffer
+    interval: 30s
+    rules:
+      - alert: OpcConnectorQueueHigh
+        expr: >-
+          (opc_connector_queue_size
+           / clamp_min(opc_connector_queue_capacity, 1)) > 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Cola en memoria > 80% ({{ $labels.instance }})"
+          description: >-
+            La ingesta supera la capacidad de escritura. Revisar latencia de BD,
+            POSTGRES_BATCH_SIZE y POSTGRES_NUM_WRITERS antes de que empiece el
+            spill a disco.
+
+      - alert: OpcConnectorSpillActive
+        expr: opc_connector_spill_bytes > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Spill en disco activo ({{ $labels.instance }})"
+          description: >-
+            Hay datos pendientes en disco. Es normal durante una caída de BD;
+            si la BD está sana, investigar el replay y la latencia de escritura.
+
+      - alert: OpcConnectorSpillCapacityHigh
+        expr: >-
+          (opc_connector_spill_bytes
+           / clamp_min(opc_connector_spill_capacity_bytes, 1)) > 0.8
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Spill > 80% de su límite ({{ $labels.instance }})"
+          description: >-
+            Al llegar al 100% se descartan segmentos antiguos (pérdida de
+            datos). Ampliar POSTGRES_SPILL_MAX_MB o recuperar la BD.
+
+      - alert: OpcConnectorSpillDataLoss
+        expr: increase(opc_connector_spill_dropped_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Segmentos de spill descartados ({{ $labels.instance }})"
+          description: >-
+            El cap de disco ha borrado datos no confirmados. Revisar capacidad
+            del volumen y el SLA de pérdida.
+
+      - alert: OpcConnectorValuesDropped
+        expr: increase(opc_connector_values_dropped_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Valores descartados por buffer/spill lleno ({{ $labels.instance }})"
+          description: >-
+            Se están perdiendo registros antes de persistirlos. Ampliar cola,
+            spill o reducir la tasa de ingesta.
+
+  - name: opcua-connector-rendimiento
+    interval: 30s
+    rules:
+      - alert: OpcConnectorBatchLagHigh
+        expr: opc_connector_batch_lag_seconds > 30
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Lag de lote > 30 s ({{ $labels.instance }})"
+          description: >-
+            El timestamp OPC más antiguo del lote tiene más de 30 s. Revisar
+            throughput, tamaño de lote y salud de la BD.
+
+      - alert: OpcConnectorWriteLatencyHigh
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (le) (rate(opc_connector_write_latency_seconds_bucket[5m]))
+          ) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Latencia de escritura p95 > 1 s ({{ $labels.instance }})"
+          description: >-
+            El COPY/INSERT está tardando más de lo presupuestado. Revisar
+            índices, compresión y recursos de PostgreSQL.
+
+  - name: opcua-connector-integridad
+    interval: 30s
+    rules:
+      - alert: OpcConnectorDedupDisabled
+        expr: opc_connector_dedup_enabled == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Deduplicación desactivada ({{ $labels.instance }})"
+          description: >-
+            POSTGRES_DEDUP_ENABLED=false: un replay tras un crash puede
+            duplicar filas. Confirmar que es una decisión operativa.
+
+      - alert: OpcConnectorDuplicatesHigh
+        expr: rate(opc_connector_values_duplicates_total[5m]) > 10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Tasa de duplicados deduplicados elevada ({{ $labels.instance }})"
+          description: >-
+            ON CONFLICT está descartando muchas filas. Si es sostenido, hay
+            reentregas repetidas (ACK/replay) y conviene revisar el spill.
+
+      - alert: OpcConnectorDrainTimeouts
+        expr: increase(opc_connector_spill_drain_timeouts_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Timeouts del drain del spill ({{ $labels.instance }})"
+          description: >-
+            El worker del spill no responde a tiempo. No se pierden datos (el
+            lote queda sin ACK), pero el replay se retrasa. Revisar I/O de disco.
+
+      - alert: OpcConnectorReconnectionsHigh
+        expr: rate(opc_connector_opc_reconnections_total[5m]) > 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Reconexiones OPC-UA frecuentes ({{ $labels.instance }})"
+          description: >-
+            Más de una reconexión por segundo de media. Revisar red, timeout de
+            sesión, certificados y logs del servidor OPC-UA.

@@ -202,6 +202,10 @@ class SpillBuffer:
         # Lectura/escritura de bool/int es atómica bajo GIL: eventual-consistente.
         self._disk_has_data = False
         self._closed = False
+        try:
+            metrics.SPILL_CAPACITY_BYTES.set(self.max_bytes if self.enabled else 0)
+        except Exception:  # noqa: BLE001
+            pass
 
         self._pending: Optional[queue.Queue] = None
         self._requests: Optional[queue.Queue] = None
