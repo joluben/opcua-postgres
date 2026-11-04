@@ -42,7 +42,9 @@ _COLUMNS = [
 ]
 _COLUMNS_SQL = ", ".join(_COLUMNS)
 
-# Tabla TEMP por conexión (cada conexión del pool tiene la suya).
+# Tabla TEMP por conexión (cada conexión del pool tiene la suya). Se crea
+# dentro de una transacción con ON COMMIT DROP: al confirmar el lote desaparece,
+# sin necesidad de TRUNCATE ni de limpiar restos de un intento fallido.
 _STAGE_TABLE = "_opc_ingest_stage"
 _STAGE_DDL = f"""
     CREATE TEMP TABLE IF NOT EXISTS {_STAGE_TABLE} (
@@ -53,7 +55,7 @@ _STAGE_DDL = f"""
         value_str    TEXT,
         quality      INTEGER,
         connector_id TEXT
-    )
+    ) ON COMMIT DROP
 """
 
 
@@ -203,6 +205,7 @@ class BatchWriter:
                 continue
             try:
                 metrics.VALUES_DROPPED.inc()
+                metrics.SHUTDOWN_DROPPED.inc()
             except Exception:  # noqa: BLE001
                 pass
 
@@ -274,22 +277,25 @@ class BatchWriter:
             return False
 
     async def _insert_dedup(self, conn: asyncpg.Connection, batch: List[Record]) -> int:
-        """COPIA a una tabla TEMP e inserta con ``ON CONFLICT DO NOTHING``.
+        """Copia a una tabla TEMP e inserta con ``ON CONFLICT DO NOTHING``.
 
-        Devuelve las filas realmente insertadas. La tabla TEMP es por conexión;
-        se trunca antes de cada lote para no arrastrar restos de un fallo previo.
+        Todo ocurre en una única transacción: la tabla de staging se crea con
+        ``ON COMMIT DROP`` y desaparece al confirmar. Si el COPY o el INSERT
+        fallan, la transacción revierte y no queda estado parcial en la conexión.
+        Devuelve las filas realmente insertadas.
         """
-        await conn.execute(_STAGE_DDL)
-        await conn.execute(f"TRUNCATE {_STAGE_TABLE}")
-        await conn.copy_records_to_table(
-            _STAGE_TABLE, records=batch, columns=_COLUMNS
-        )
-        status = await conn.execute(
-            f"INSERT INTO {self._table} ({_COLUMNS_SQL}) "
-            f"SELECT {_COLUMNS_SQL} FROM {_STAGE_TABLE} "
-            f"ON CONFLICT (event_id, ts) WHERE event_id IS NOT NULL DO NOTHING"
-        )
-        inserted = _rows_affected(status)
+        async with conn.transaction():
+            await conn.execute(_STAGE_DDL)
+            await conn.copy_records_to_table(
+                _STAGE_TABLE, records=batch, columns=_COLUMNS
+            )
+            inserted_rows = await conn.fetch(
+                f"INSERT INTO {self._table} ({_COLUMNS_SQL}) "
+                f"SELECT {_COLUMNS_SQL} FROM {_STAGE_TABLE} "
+                f"ON CONFLICT (event_id, ts) WHERE event_id IS NOT NULL DO NOTHING "
+                f"RETURNING 1"
+            )
+        inserted = len(inserted_rows)
         duplicates = len(batch) - inserted
         if duplicates > 0:
             try:

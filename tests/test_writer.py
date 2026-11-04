@@ -72,14 +72,31 @@ def test_rows_affected_parses_insert_status():
     assert _rows_affected("basura") == 0
 
 
+class _Tx:
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
 class _DedupConn:
     def __init__(self) -> None:
         self.executed = []
         self.copied = None
+        self.transactions = 0
+
+    def transaction(self):
+        self.transactions += 1
+        return _Tx()
 
     async def execute(self, query, *args):
         self.executed.append(query)
         return "INSERT 0 2"
+
+    async def fetch(self, query, *args):
+        self.executed.append(query)
+        return [1, 1]
 
     async def copy_records_to_table(self, table, *, records, columns):
         self.copied = (table, list(records), list(columns))
@@ -98,12 +115,34 @@ async def test_insert_dedup_uses_stage_and_on_conflict():
     inserted = await writer._insert_dedup(conn, batch)
 
     assert inserted == 2
+    assert conn.transactions == 1
     assert conn.copied[0] == "_opc_ingest_stage"
     assert conn.copied[2] == _COLUMNS
-    assert any("CREATE TEMP TABLE" in q for q in conn.executed)
+    create_sql = [q for q in conn.executed if "CREATE TEMP TABLE" in q]
+    assert create_sql and "ON COMMIT DROP" in create_sql[0]
+    assert not any("TRUNCATE" in q for q in conn.executed)
     insert_sql = [q for q in conn.executed if q.startswith("INSERT INTO")]
     assert insert_sql and "ON CONFLICT (event_id, ts)" in insert_sql[0]
     assert "DO NOTHING" in insert_sql[0]
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drop_is_counted_when_spill_rejects():
+    class _RejectingSpill:
+        def write(self, _item) -> bool:
+            return False
+
+    from connector.utils import metrics
+
+    before = metrics.SHUTDOWN_DROPPED._value.get()
+    cfg = SimpleNamespace(data_table="t", batch_size=10, flush_interval_ms=500)
+    writer = BatchWriter(
+        pool=None, cfg=cfg, queue=asyncio.Queue(), spill=_RejectingSpill(),
+    )
+
+    writer._spill_or_drop([("a",), ("b",)])
+
+    assert metrics.SHUTDOWN_DROPPED._value.get() - before == 2
 
 
 class _ReplaySpill:

@@ -191,6 +191,36 @@
       ],
       "title": "Pérdidas y eventos operativos (5m)",
       "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "short" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 28 },
+      "id": 11,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        { "expr": "opc_connector_spill_replay_pending", "legendFormat": "replay pendiente {{instance}}", "refId": "A" },
+        { "expr": "increase(opc_connector_spill_dropped_unacked_total[5m])", "legendFormat": "descartado sin ACK {{instance}}", "refId": "B" }
+      ],
+      "title": "Durabilidad del replay",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" }, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 28 },
+      "id": 12,
+      "options": { "legend": { "displayMode": "table", "placement": "bottom" }, "tooltip": { "mode": "multi" } },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, instance) (rate(opc_connector_shutdown_seconds_bucket[1h])))",
+          "legendFormat": "p95 apagado {{instance}}",
+          "refId": "A"
+        },
+        { "expr": "increase(opc_connector_shutdown_dropped_total[5m])", "legendFormat": "perdidos al apagar {{instance}}", "refId": "B" }
+      ],
+      "title": "Apagado ordenado",
+      "type": "timeseries"
     }
   ],
   "refresh": "30s",

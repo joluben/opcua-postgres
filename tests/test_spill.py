@@ -5,7 +5,8 @@ import uuid
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
-from connector.db.spill import SpillBuffer, _decode, enqueue_or_spill
+from connector.db.spill import ReplayToken, SpillBuffer, _decode, enqueue_or_spill
+from connector.utils import metrics
 
 
 def _cfg(tmp_path):
@@ -132,3 +133,100 @@ def test_disabled_spill_is_noop(tmp_path):
 
     assert sb.write(_record()) is False
     assert sb.has_data() is False
+
+
+def test_replay_pending_gauge_tracks_inflight(tmp_path):
+    sb = SpillBuffer(_cfg(tmp_path), "connector-01")
+    sb.write(_record())
+    sb.write(_record())
+
+    batch = sb.drain(10)
+    assert len(batch.records) == 2
+    assert metrics.SPILL_REPLAY_PENDING._value.get() == 2
+
+    _ack_all(sb, batch)
+    assert metrics.SPILL_REPLAY_PENDING._value.get() == 0
+    sb.close()
+
+
+def _bare_spill(tmp_path, max_bytes: int) -> SpillBuffer:
+    """SpillBuffer sin worker para probar el cap de forma determinista."""
+    sb = object.__new__(SpillBuffer)
+    sb.dir = tmp_path
+    sb.max_bytes = max_bytes
+    sb._cur_path = None
+    sb._cur_file = None
+    sb._cur_size = 0
+    sb._inflight = None
+    return sb
+
+
+def _segment(tmp_path, name: str, nbytes: int, ack: int | None = None):
+    path = tmp_path / name
+    path.write_bytes(b"x" * nbytes)
+    if ack is not None:
+        path.with_name(path.name + ".ack").write_text(str(ack), encoding="ascii")
+    return path
+
+
+def test_cap_drops_acked_segment_before_unacked(tmp_path):
+    sb = _bare_spill(tmp_path, max_bytes=10)
+    acked = _segment(tmp_path, "spill-1.jsonl", 10, ack=10)
+    pending = _segment(tmp_path, "spill-2.jsonl", 10)
+    before = metrics.SPILL_DROPPED_UNACKED._value.get()
+
+    sb._w_enforce_cap()
+
+    assert not acked.exists()
+    assert pending.exists()
+    assert metrics.SPILL_DROPPED_UNACKED._value.get() == before
+
+
+def test_cap_drops_unacked_only_as_last_resort_and_is_visible(tmp_path):
+    sb = _bare_spill(tmp_path, max_bytes=5)
+    acked = _segment(tmp_path, "spill-3.jsonl", 10, ack=10)
+    pending = _segment(tmp_path, "spill-4.jsonl", 10)
+    before = metrics.SPILL_DROPPED_UNACKED._value.get()
+
+    sb._w_enforce_cap()
+
+    assert not acked.exists()
+    assert not pending.exists()
+    assert metrics.SPILL_DROPPED_UNACKED._value.get() - before == 1
+
+
+def test_cap_never_drops_inflight_segment(tmp_path):
+    sb = _bare_spill(tmp_path, max_bytes=5)
+    inflight = _segment(tmp_path, "spill-5.jsonl", 20)
+    sb._inflight = [ReplayToken(inflight.name, 0)]
+
+    sb._w_enforce_cap()
+
+    assert inflight.exists()
+
+
+def test_drain_timeout_does_not_lose_records(tmp_path):
+    """Si el worker no responde a tiempo, el lote se reentrega en el siguiente ciclo."""
+    import time
+
+    sb = SpillBuffer(_cfg(tmp_path), "connector-01")
+    sb.drain_timeout_s = 0.05
+    sb.write(_record())
+    sb.flush()
+
+    original = sb._w_drain
+
+    def slow_drain(max_n):
+        time.sleep(0.2)
+        return original(max_n)
+
+    sb._w_drain = slow_drain
+    assert sb.drain(10).records == []  # timeout
+    sb.flush()                         # espera al worker y procesa el cancel
+    sb._w_drain = original
+    sb.drain_timeout_s = 5.0
+
+    again = sb.drain(10)
+    assert len(again.records) == 1
+    _ack_all(sb, again)
+    sb.close()

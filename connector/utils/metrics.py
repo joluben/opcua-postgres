@@ -36,7 +36,15 @@ DB_STATUS = Gauge("opc_connector_db_status", "Estado conexión BD (1=ok, 0=ko)")
 SPILL_WRITTEN = Counter("opc_connector_spill_written_total", "Registros volcados a disco (spill)")
 SPILL_REPLAYED = Counter("opc_connector_spill_replayed_total", "Registros releídos desde disco")
 SPILL_DROPPED = Counter("opc_connector_spill_dropped_total", "Segmentos de spill descartados por límite de disco")
+SPILL_DROPPED_UNACKED = Counter(
+    "opc_connector_spill_dropped_unacked_total",
+    "Segmentos de spill descartados por el cap sin ACK (pérdida de datos)",
+)
 SPILL_ACKED = Counter("opc_connector_spill_acked_total", "Lotes de spill confirmados tras el commit en BD")
+SPILL_REPLAY_PENDING = Gauge(
+    "opc_connector_spill_replay_pending",
+    "Registros leídos del spill pendientes de ACK (inflight)",
+)
 SPILL_DRAIN_TIMEOUTS = Counter(
     "opc_connector_spill_drain_timeouts_total",
     "Timeouts esperando al worker del spill (no se descartan datos)",
@@ -50,6 +58,14 @@ SPILL_CAPACITY_BYTES = Gauge(
 DEDUP_ENABLED = Gauge(
     "opc_connector_dedup_enabled",
     "Deduplicación idempotente activa (1) o desactivada (0)",
+)
+SHUTDOWN_SECONDS = Histogram(
+    "opc_connector_shutdown_seconds",
+    "Duración del apagado ordenado (SIGTERM → cierre)",
+)
+SHUTDOWN_DROPPED = Counter(
+    "opc_connector_shutdown_dropped_total",
+    "Registros no drenados ni persistidos durante el apagado",
 )
 
 

@@ -219,6 +219,11 @@ class SpillBuffer:
         self._writes_since_fsync = 0
         # Tokens leídos pendientes de ACK (solo worker). Evita doble entrega.
         self._inflight: Optional[List[ReplayToken]] = None
+        self._inflight_records = 0
+        try:
+            metrics.SPILL_REPLAY_PENDING.set(0)
+        except Exception:  # noqa: BLE001
+            pass
 
         if not self.enabled:
             return
@@ -476,6 +481,11 @@ class SpillBuffer:
                     self._w_nack(req.tokens)
                 elif isinstance(req, _CancelDrainReq):
                     self._inflight = None
+                    self._inflight_records = 0
+                    try:
+                        metrics.SPILL_REPLAY_PENDING.set(0)
+                    except Exception:  # noqa: BLE001
+                        pass
             except Exception as exc:  # noqa: BLE001
                 log.warning("spill_request_failed", error=str(exc))
                 try:
@@ -554,6 +564,14 @@ class SpillBuffer:
         self._disk_has_data = False
 
     def _w_enforce_cap(self) -> None:
+        """Aplica el límite de disco sin borrar datos no confirmados si es evitable.
+
+        Prioridad:
+        1. Segmentos ya confirmados por completo (offset ACK >= tamaño).
+        2. Solo como último recurso, segmentos con datos sin ACK: se registran en
+           ``spill_dropped_unacked_total`` y con un log explícito.
+        El segmento actual y los que están *inflight* nunca se tocan.
+        """
         try:
             sizes: dict[Path, int] = {}
             for p in self._w_segments():
@@ -564,22 +582,55 @@ class SpillBuffer:
                 except OSError:
                     continue
             total = sum(sizes.values())
+            if total <= self.max_bytes:
+                return
             inflight = {t.segment for t in (self._inflight or [])}
             candidates = sorted(
                 p for p in sizes
                 if p != self._cur_path and p.name not in inflight
             )
-            for oldest in candidates:
-                if total <= self.max_bytes:
-                    break
+            acked: list[Path] = []
+            unacked: list[Path] = []
+            for p in candidates:
+                if self._w_read_ack(p) >= sizes.get(p, 0):
+                    acked.append(p)
+                else:
+                    unacked.append(p)
+
+            def _drop(oldest: Path, *, is_unacked: bool) -> None:
+                nonlocal total
                 freed = sizes.get(oldest, 0)
+                ack_offset = self._w_read_ack(oldest)
                 self._w_remove_segment(oldest)
                 total -= freed
                 try:
                     metrics.SPILL_DROPPED.inc()
                 except Exception:  # noqa: BLE001
                     pass
-                log.warning("spill_segment_dropped", segment=str(oldest))
+                if is_unacked:
+                    try:
+                        metrics.SPILL_DROPPED_UNACKED.inc()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    log.warning(
+                        "spill_segment_dropped_unacked",
+                        segment=str(oldest),
+                        bytes=freed,
+                        ack_offset=ack_offset,
+                    )
+                else:
+                    log.warning("spill_segment_dropped", segment=str(oldest))
+
+            # 1) Primero lo ya confirmado (no supone pérdida de datos).
+            for oldest in acked:
+                if total <= self.max_bytes:
+                    return
+                _drop(oldest, is_unacked=False)
+            # 2) Último recurso: datos no confirmados; pérdida visible.
+            for oldest in unacked:
+                if total <= self.max_bytes:
+                    return
+                _drop(oldest, is_unacked=True)
         except Exception:  # noqa: BLE001
             pass
 
@@ -692,8 +743,10 @@ class SpillBuffer:
 
         if batch.records:
             self._inflight = list(batch.tokens)
+            self._inflight_records = len(batch.records)
             try:
                 metrics.SPILL_REPLAYED.inc(len(batch.records))
+                metrics.SPILL_REPLAY_PENDING.set(self._inflight_records)
             except Exception:  # noqa: BLE001
                 pass
         self._w_update_metrics()
@@ -770,12 +823,22 @@ class SpillBuffer:
             except Exception:  # noqa: BLE001
                 pass
         self._inflight = None
+        self._inflight_records = 0
+        try:
+            metrics.SPILL_REPLAY_PENDING.set(0)
+        except Exception:  # noqa: BLE001
+            pass
         self._w_update_metrics()
         self._w_refresh_disk_flag()
 
     def _w_nack(self, tokens: List[ReplayToken]) -> None:
         """Abandona el lote sin tocar offsets: se releerá en el próximo drain."""
         self._inflight = None
+        self._inflight_records = 0
+        try:
+            metrics.SPILL_REPLAY_PENDING.set(0)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _w_remove_segment(self, seg: Path) -> None:
         if seg == self._cur_path and self._cur_file:

@@ -15,7 +15,11 @@ def test_grafana_dashboard_is_valid_json_with_panels():
     )
     assert dashboard["uid"] == "opcua-connector"
     titles = {p["title"] for p in dashboard["panels"]}
-    assert {"Conectores UP", "Spill en disco", "Integridad: duplicados / replay / ACK"} <= titles
+    assert {
+        "Conectores UP", "Spill en disco",
+        "Integridad: duplicados / replay / ACK",
+        "Durabilidad del replay", "Apagado ordenado",
+    } <= titles
     for panel in dashboard["panels"]:
         assert panel["targets"], f"panel sin consulta: {panel['title']}"
 
@@ -27,6 +31,10 @@ def test_prometheus_alerts_cover_critical_failures():
         "OpcConnectorDbDown",
         "OpcConnectorSpillCapacityHigh",
         "OpcConnectorSpillDataLoss",
+        "OpcConnectorSpillDroppedUnacked",
+        "OpcConnectorSpillReplayPending",
+        "OpcConnectorShutdownDropped",
+        "OpcConnectorShutdownSlow",
         "OpcConnectorValuesDropped",
         "OpcConnectorDedupDisabled",
     ):

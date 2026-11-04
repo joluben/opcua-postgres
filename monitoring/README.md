@@ -47,6 +47,10 @@ curl -X POST http://localhost:9090/-/reload
 | `OpcConnectorSpillActive` | warning | spill > 0 durante 10 min |
 | `OpcConnectorSpillCapacityHigh` | critical | spill > 80% de `POSTGRES_SPILL_MAX_MB` |
 | `OpcConnectorSpillDataLoss` | critical | segmentos de spill descartados |
+| `OpcConnectorSpillDroppedUnacked` | critical | cap aplicado sobre datos sin ACK |
+| `OpcConnectorSpillReplayPending` | warning | registros leídos sin ACK > 5 min |
+| `OpcConnectorShutdownDropped` | critical | registros perdidos al apagar |
+| `OpcConnectorShutdownSlow` | warning | p95 del apagado > 24 s |
 | `OpcConnectorValuesDropped` | critical | valores perdidos por buffer/spill lleno |
 | `OpcConnectorBatchLagHigh` | warning | lag > 30 s |
 | `OpcConnectorWriteLatencyHigh` | warning | p95 de escritura > 1 s |

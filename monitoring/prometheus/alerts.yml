@@ -96,6 +96,18 @@ groups:
             El cap de disco ha borrado datos no confirmados. Revisar capacidad
             del volumen y el SLA de pérdida.
 
+      - alert: OpcConnectorSpillDroppedUnacked
+        expr: increase(opc_connector_spill_dropped_unacked_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Spill descartado sin ACK: pérdida de datos ({{ $labels.instance }})"
+          description: >-
+            El límite de disco se ha aplicado sobre segmentos cuyos datos aún no
+            se habían confirmado en PostgreSQL. Ampliar el volumen/spill o
+            recuperar la BD; revisar el SLA de pérdida.
+
       - alert: OpcConnectorValuesDropped
         expr: increase(opc_connector_values_dropped_total[5m]) > 0
         for: 1m
@@ -170,6 +182,43 @@ groups:
           description: >-
             El worker del spill no responde a tiempo. No se pierden datos (el
             lote queda sin ACK), pero el replay se retrasa. Revisar I/O de disco.
+
+      - alert: OpcConnectorSpillReplayPending
+        expr: opc_connector_spill_replay_pending > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Replay del spill pendiente de ACK ({{ $labels.instance }})"
+          description: >-
+            Hay registros leídos del spill que llevan más de 5 minutos sin
+            confirmarse en BD. Comprobar errores de escritura, latencia y el
+            estado de PostgreSQL; el lote se reintenta sin pérdida.
+
+      - alert: OpcConnectorShutdownDropped
+        expr: increase(opc_connector_shutdown_dropped_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Registros perdidos durante el apagado ({{ $labels.instance }})"
+          description: >-
+            El apagado no pudo drenar ni persistir todos los registros. Revisar
+            el volumen de spill y ampliar SHUTDOWN_TIMEOUT_S/stop_grace_period.
+
+      - alert: OpcConnectorShutdownSlow
+        expr: >-
+          histogram_quantile(0.95,
+            sum by (le) (rate(opc_connector_shutdown_seconds_bucket[1h]))
+          ) > 24
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Apagado cerca del timeout ({{ $labels.instance }})"
+          description: >-
+            El p95 del apagado supera 24 s (80% de SHUTDOWN_TIMEOUT_S=30 s).
+            Aumentar el timeout o investigar el drenado del spill.
 
       - alert: OpcConnectorReconnectionsHigh
         expr: rate(opc_connector_opc_reconnections_total[5m]) > 1

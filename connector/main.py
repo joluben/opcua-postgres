@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import os
 import signal
+import time
 
 from .config import Config
 from .db import pool as db_pool
@@ -152,8 +153,12 @@ async def main() -> None:
 
     stop_event = asyncio.Event()
     loop = asyncio.get_running_loop()
+    shutdown_started: float | None = None
 
     def _request_stop(sig: signal.Signals) -> None:
+        nonlocal shutdown_started
+        if shutdown_started is None:
+            shutdown_started = time.monotonic()
         log.info("shutdown_requested", signal=sig.name)
         stop_event.set()
 
@@ -202,8 +207,14 @@ async def main() -> None:
             else:
                 attempt = 0
     finally:
+        if shutdown_started is None:
+            shutdown_started = time.monotonic()
         spill.close()
         await runner.cleanup()
+        try:
+            metrics.SHUTDOWN_SECONDS.observe(time.monotonic() - shutdown_started)
+        except Exception:  # noqa: BLE001
+            pass
         log.info("connector_stop")
 
 

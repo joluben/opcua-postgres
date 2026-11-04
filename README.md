@@ -157,7 +157,11 @@ Métricas clave:
 | `opc_connector_spill_written_total` / `..._replayed_total` | Registros volcados / reinyectados desde spill |
 | `opc_connector_spill_dropped_total` / `values_dropped_total` | Pérdida por spill lleno / buffer lleno |
 | `opc_connector_spill_acked_total` | Lotes de spill confirmados tras el commit en BD |
+| `opc_connector_spill_dropped_unacked_total` | Segmentos descartados por el cap sin ACK (pérdida) |
+| `opc_connector_spill_replay_pending` | Registros leídos del spill pendientes de ACK |
 | `opc_connector_spill_drain_timeouts_total` | Timeouts del drain (no implican pérdida: se reintenta) |
+| `opc_connector_shutdown_seconds` | Duración del apagado ordenado (histograma) |
+| `opc_connector_shutdown_dropped_total` | Registros no drenados ni persistidos al apagar |
 | `opc_connector_values_duplicates_total` | Filas deduplicadas por `ON CONFLICT DO NOTHING` |
 | `opc_connector_dedup_enabled` | Deduplicación activa (1/0) |
 | `opc_connector_session_status` / `opc_connector_db_status` | Estado OPC (1/0) y BD (1/0) |
@@ -183,7 +187,7 @@ pip install -r requirements.lock pytest
 pytest -q
 ```
 
-44 tests que **no requieren** servidor OPC-UA ni BD: validan la configuración fail-closed,
+50 tests que **no requieren** servidor OPC-UA ni BD: validan la configuración fail-closed,
 las políticas SSL (`_build_ssl` y CA vía `PGSSLROOTCERT`), los filtros de browse, el
 roundtrip/ACK/reinicio del spill, la compatibilidad con líneas legacy de 6 campos, la
 inserción idempotente (`ON CONFLICT`) y la política de requeue del writer.
