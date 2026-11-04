@@ -1,0 +1,63 @@
+version: "3.9"
+
+# Despliegue de MÚLTIPLES conectores en paralelo, cada uno con su partición de tags.
+# La base de datos (TimescaleDB) reside en un SERVIDOR INDEPENDIENTE (ver .env -> POSTGRES_HOST).
+#
+# Uso:
+#   docker compose -f docker-compose.yml -f docker-compose.scale.yml up -d --build
+#
+# Los secrets (postgres_password, opc_password) y los límites de recursos se heredan
+# de docker-compose.yml. Los ficheros de secrets deben existir antes de levantar.
+#
+# NOTA de particionamiento: el reparto OPC_TAG_OFFSET/OPC_TAG_LIMIT debe basarse en un
+# orden estable del catálogo (ORDER BY node_id) para evitar solapes/huecos. Ajustar el
+# número de conectores y OPC_TAG_LIMIT al throughput real validado de asyncua (ver §9.3/§14).
+
+services:
+  connector-01:
+    extends:
+      file: docker-compose.yml
+      service: connector-01
+    container_name: opc-connector-01
+    environment:
+      CONNECTOR_ID: connector-01
+      OPC_TAG_OFFSET: "0"
+      OPC_TAG_LIMIT: "5000"
+    ports:
+      - "8001:8000"
+
+  connector-02:
+    extends:
+      file: docker-compose.yml
+      service: connector-01
+    container_name: opc-connector-02
+    environment:
+      CONNECTOR_ID: connector-02
+      OPC_TAG_OFFSET: "5000"
+      OPC_TAG_LIMIT: "5000"
+    ports:
+      - "8002:8000"
+
+  connector-03:
+    extends:
+      file: docker-compose.yml
+      service: connector-01
+    container_name: opc-connector-03
+    environment:
+      CONNECTOR_ID: connector-03
+      OPC_TAG_OFFSET: "10000"
+      OPC_TAG_LIMIT: "5000"
+    ports:
+      - "8003:8000"
+
+  connector-04:
+    extends:
+      file: docker-compose.yml
+      service: connector-01
+    container_name: opc-connector-04
+    environment:
+      CONNECTOR_ID: connector-04
+      OPC_TAG_OFFSET: "15000"
+      OPC_TAG_LIMIT: "5000"
+    ports:
+      - "8004:8000"
