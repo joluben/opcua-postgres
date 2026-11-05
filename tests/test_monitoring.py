@@ -37,6 +37,9 @@ def test_prometheus_alerts_cover_critical_failures():
         "OpcConnectorShutdownSlow",
         "OpcConnectorValuesDropped",
         "OpcConnectorDedupDisabled",
+        "OpcConnectorSpillWriteErrors",
+        "OpcConnectorSpillFsyncErrors",
+        "OpcConnectorSpillRecordsDropped",
     ):
         assert name in alerts
 

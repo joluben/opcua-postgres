@@ -149,6 +149,39 @@ async def test_duplicate_batch_is_idempotent():
 
 
 @pytest.mark.asyncio
+async def test_dedup_disabled_falls_back_when_unique_index_exists():
+    """Dedup apagada pero índice preexistente: el COPY falla y se degrada.
+
+    Regresión del `NameError` que impedía ejecutar el fallback y dejaba el lote
+    en un bucle de reintentos.
+    """
+    catalog, data, pool = await _prepare_schema()
+    try:
+        tag_id = await _tag_id(pool, catalog)
+        batch = [_record(tag_id) for _ in range(4)]
+        writer = BatchWriter(
+            pool=pool,
+            cfg=SimpleNamespace(
+                data_table=data, batch_size=100, flush_interval_ms=500,
+                dedup_enabled=False,
+            ),
+            queue=None,
+        )
+
+        assert await writer._flush(batch, requeue_on_failure=False) is True
+        # El segundo COPY viola el índice; debe caer al INSERT ... ON CONFLICT.
+        assert await writer._flush(batch, requeue_on_failure=False) is True
+
+        async with pool.acquire() as conn:
+            total = await conn.fetchval(f"SELECT COUNT(*) FROM {data}")
+        assert total == len(batch)
+    finally:
+        async with pool.acquire() as conn:
+            await _drop(conn, data, catalog)
+        await pool.close()
+
+
+@pytest.mark.asyncio
 async def test_crash_between_replay_and_ack_does_not_duplicate(tmp_path):
     """Flujo completo: spill -> drain sin ACK -> reentrega -> dedup en BD."""
     catalog, data, pool = await _prepare_schema()

@@ -27,6 +27,8 @@ import uuid
 from datetime import datetime, timezone
 from typing import List, Tuple
 
+import asyncpg
+
 from ..config import DbConfig
 from ..utils import metrics
 from ..utils.logger import get_logger

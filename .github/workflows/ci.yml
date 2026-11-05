@@ -12,8 +12,13 @@
 #   - Tag v*.*.*           → tests + build + push (tag: semver + latest)
 #
 # Requisitos:
-#   - Settings → Actions → General → Workflow permissions → Read and write
-#   - GITHUB_TOKEN tiene permiso automático para ghcr.io
+#   - Settings → Actions → General → Workflow permissions: basta con la opción
+#     restrictiva ("Read repository contents and packages permissions"), porque
+#     este workflow declara permisos explícitos por job.
+#   - Paquete GHCR existente: Settings del paquete → Manage Actions access →
+#     añadir este repositorio con rol Write (o definir el secret GHCR_TOKEN).
+#   - GITHUB_TOKEN tiene permiso automático para ghcr.io si el paquete está
+#     enlazado/accesible por el repositorio.
 # ============================================================================
 name: CI
 
@@ -28,17 +33,18 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
 
-permissions:
-  contents: read
-  packages: write
-
 jobs:
   # ── Job 1: Tests ──────────────────────────────────────────────────────────
   test:
     name: Tests
     runs-on: ubuntu-latest
+    # Permisos mínimos: este job no publica nada.
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -53,7 +59,10 @@ jobs:
           # Instala versiones exactas del lock (reproducible).
           pip install -r requirements.lock
           # Herramientas de test (no forman parte del runtime).
-          pip install "pytest>=8,<10" "pytest-asyncio>=1.0,<2"
+          pip install "pytest>=8,<10" "pytest-asyncio>=1.0,<2" "ruff>=0.6,<1"
+
+      - name: Lint (nombres no definidos / F821)
+        run: ruff check --select F821 connector tests
 
       - name: Run tests
         run: python -m pytest tests/ -q --tb=short
@@ -63,6 +72,9 @@ jobs:
     name: Integration (PostgreSQL + restricted role)
     needs: test
     runs-on: ubuntu-latest
+    # Permisos mínimos: solo lee el repositorio.
+    permissions:
+      contents: read
     services:
       timescaledb:
         image: timescale/timescaledb:2.17.2-pg16
@@ -78,6 +90,8 @@ jobs:
           --health-retries 20
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
@@ -115,8 +129,14 @@ jobs:
     name: Build & Push Image
     needs: test
     runs-on: ubuntu-latest
+    # Único job que necesita publicar en GHCR.
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up QEMU (multi-arch)
         uses: docker/setup-qemu-action@v3
@@ -129,8 +149,11 @@ jobs:
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          # GITHUB_TOKEN solo puede escribir si el paquete ya existente concede
+          # acceso Write a este repositorio (Manage Actions access). Como
+          # alternativa, definir GHCR_TOKEN (PAT clásico con write:packages).
+          username: ${{ secrets.GHCR_USERNAME || github.repository_owner }}
+          password: ${{ secrets.GHCR_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Extract metadata (tags + labels)
         id: meta

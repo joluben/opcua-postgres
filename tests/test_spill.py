@@ -230,3 +230,215 @@ def test_drain_timeout_does_not_lose_records(tmp_path):
     assert len(again.records) == 1
     _ack_all(sb, again)
     sb.close()
+
+
+# ── Fase 5: errores de disco no pueden perder lotes en silencio ─────────────
+
+class _BoomFile:
+    """Fichero cuyo write falla con OSError."""
+
+    def __init__(self, error="disk full"):
+        self.error = error
+        self.closed = False
+
+    def write(self, _blob):
+        raise OSError(self.error)
+
+    def flush(self):
+        pass
+
+    def fileno(self):
+        return -1
+
+    def close(self):
+        self.closed = True
+
+
+class _FsyncBoomFile:
+    """Escribe correctamente pero falla al hacer fsync."""
+
+    def __init__(self, path):
+        self._f = open(path, "a", encoding="utf-8")
+        self.closed = False
+
+    def write(self, blob):
+        self._f.write(blob)
+        return len(blob)
+
+    def flush(self):
+        self._f.flush()
+
+    def fileno(self):
+        raise OSError("fsync unavailable")
+
+    def close(self):
+        self._f.close()
+        self.closed = True
+
+
+def _bare_write_spill(tmp_path, *, cur_file=None, filename="spill-bare.jsonl"):
+    sb = object.__new__(SpillBuffer)
+    sb.dir = tmp_path
+    sb.segment_bytes = 1 << 20
+    sb.fsync_every = 100
+    sb.max_bytes = 10 * 1024 * 1024
+    sb._cur_path = tmp_path / filename
+    sb._cur_file = cur_file
+    sb._cur_size = 0
+    sb._writes_since_fsync = 0
+    sb._disk_has_data = False
+    sb._disk_healthy = True
+    sb._retry_backlog = []
+    sb._retry_max = 10
+    sb._retry_attempts = 0
+    sb._retry_after = 0.0
+    return sb
+
+
+def test_write_oserror_is_retried_and_counted(tmp_path):
+    sb = _bare_write_spill(tmp_path, cur_file=_BoomFile())
+    rec = _record()
+    before_written = metrics.SPILL_WRITTEN._value.get()
+    before_errors = metrics.SPILL_WRITE_ERRORS._value.get()
+
+    assert sb._w_write_batch([rec]) is False
+    assert sb._retry_backlog == [rec]            # se reintenta, no se pierde
+    assert sb._disk_healthy is False
+    assert metrics.SPILL_WRITTEN._value.get() == before_written
+    assert metrics.SPILL_WRITE_ERRORS._value.get() - before_errors == 1
+    # Mientras el disco no está sano, write() rechaza de forma visible.
+    sb.enabled = True
+    sb._closed = False
+    import queue as _queue
+    sb._pending = _queue.Queue()
+    assert sb.write(_record()) is False
+
+
+def test_write_oserror_backlog_is_bounded_and_visible(tmp_path):
+    sb = _bare_write_spill(tmp_path, cur_file=_BoomFile())
+    sb._retry_max = 2
+    before_dropped = metrics.SPILL_DROPPED_RECORDS._value.get()
+
+    sb._w_write_batch([_record()])   # backlog: 1
+    sb._w_write_batch([_record()])   # backlog: 2
+    sb._w_write_batch([_record()])   # desborda: descarta el más antiguo
+
+    assert len(sb._retry_backlog) == 2
+    assert metrics.SPILL_DROPPED_RECORDS._value.get() - before_dropped == 1
+
+
+def test_failed_batch_is_written_after_disk_recovers(tmp_path):
+    path = tmp_path / "spill-bare.jsonl"
+    sb = _bare_write_spill(tmp_path, cur_file=_BoomFile())
+    rec = _record()
+    before_written = metrics.SPILL_WRITTEN._value.get()
+
+    assert sb._w_write_batch([rec]) is False
+    assert len(sb._retry_backlog) == 1
+
+    # El disco se recupera: el worker reintenta el backlog y lo persiste.
+    sb._cur_file = open(path, "a", encoding="utf-8")
+    sb._retry_after = 0.0
+    sb._w_retry_pending()
+
+    assert sb._retry_backlog == []
+    assert sb._disk_healthy is True
+    assert metrics.SPILL_WRITTEN._value.get() - before_written == 1
+    sb._cur_file.flush()
+    assert str(rec[0]) in path.read_text(encoding="utf-8")
+    sb._cur_file.close()
+
+
+def test_open_failure_keeps_batch_for_retry(tmp_path):
+    sb = _bare_write_spill(tmp_path, cur_file=None)
+    sb.dir = tmp_path / "no-existe"          # os.open falla con OSError
+    sb._cur_path = None
+    rec = _record()
+    before_errors = metrics.SPILL_WRITE_ERRORS._value.get()
+
+    assert sb._w_write_batch([rec]) is False
+    assert sb._retry_backlog == [rec]
+    assert sb._disk_healthy is False
+    assert metrics.SPILL_WRITE_ERRORS._value.get() - before_errors == 1
+
+
+def test_rotate_failure_keeps_batch_for_retry(tmp_path):
+    sb = _bare_write_spill(tmp_path, cur_file=open(tmp_path / "spill-bare.jsonl", "a"))
+    sb.segment_bytes = 0                    # fuerza rotación
+    rec = _record()
+
+    def _boom():
+        raise OSError("rotate failed")
+
+    sb._w_rotate = _boom
+
+    assert sb._w_write_batch([rec]) is False
+    assert sb._retry_backlog == [rec]
+    sb._cur_file.close()
+
+
+def test_fsync_failure_is_counted_and_marks_disk_unhealthy(tmp_path):
+    path = tmp_path / "spill-bare.jsonl"
+    sb = _bare_write_spill(tmp_path, cur_file=_FsyncBoomFile(path))
+    sb.fsync_every = 1
+    before_fsync = metrics.SPILL_FSYNC_ERRORS._value.get()
+    before_written = metrics.SPILL_WRITTEN._value.get()
+
+    assert sb._w_write_batch([_record()]) is True  # el write sí se hizo
+    assert metrics.SPILL_FSYNC_ERRORS._value.get() - before_fsync == 1
+    assert metrics.SPILL_WRITTEN._value.get() - before_written == 1
+    assert sb._disk_healthy is False
+    sb._cur_file.close()
+
+
+def test_serialization_failure_is_counted_not_silent(tmp_path):
+    sb = _bare_write_spill(tmp_path, cur_file=open(tmp_path / "spill-bare.jsonl", "a"))
+    bad = (uuid.uuid4(), 1, object(), 1.0, None, 0, "connector-01")
+    before = metrics.SPILL_SERIALIZATION_ERRORS._value.get()
+
+    assert sb._w_write_batch([bad]) is True   # no hay nada escribible
+    assert metrics.SPILL_SERIALIZATION_ERRORS._value.get() - before == 1
+    assert sb._retry_backlog == []
+    sb._cur_file.close()
+
+
+class _PartialWriteFile:
+    """Escribe bytes parciales y luego falla (simula I/O error a mitad)."""
+
+    def __init__(self, path):
+        self._f = open(path, "a", encoding="utf-8")
+
+    def write(self, blob):
+        self._f.write(blob[:3])
+        self._f.flush()
+        raise OSError("disk full mid-write")
+
+    def flush(self):
+        self._f.flush()
+
+    def truncate(self, offset):
+        self._f.truncate(offset)
+        self._f.flush()
+
+    def seek(self, *args):
+        return self._f.seek(*args)
+
+    def fileno(self):
+        return self._f.fileno()
+
+    def close(self):
+        self._f.close()
+
+
+def test_partial_write_is_truncated_before_retry(tmp_path):
+    path = tmp_path / "spill-partial.jsonl"
+    path.write_text("old\n", encoding="utf-8")
+    sb = _bare_write_spill(tmp_path, cur_file=_PartialWriteFile(path),
+                           filename="spill-partial.jsonl")
+    sb._cur_size = 4
+
+    assert sb._w_write_batch([_record()]) is False
+    # La escritura parcial se revierte: el reintento no deja una línea corrupta.
+    assert path.read_text(encoding="utf-8") == "old\n"
+    assert sb._cur_size == 4
+    sb._cur_file.close()

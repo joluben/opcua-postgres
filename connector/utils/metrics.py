@@ -49,6 +49,22 @@ SPILL_DRAIN_TIMEOUTS = Counter(
     "opc_connector_spill_drain_timeouts_total",
     "Timeouts esperando al worker del spill (no se descartan datos)",
 )
+SPILL_WRITE_ERRORS = Counter(
+    "opc_connector_spill_write_errors_total",
+    "Errores de escritura/apertura/rotación en el worker del spill",
+)
+SPILL_FSYNC_ERRORS = Counter(
+    "opc_connector_spill_fsync_errors_total",
+    "Fallos de flush/fsync en el spill",
+)
+SPILL_SERIALIZATION_ERRORS = Counter(
+    "opc_connector_spill_serialization_errors_total",
+    "Registros no serializables descartados por el spill",
+)
+SPILL_DROPPED_RECORDS = Counter(
+    "opc_connector_spill_dropped_records_total",
+    "Registros descartados tras agotar los reintentos de disco",
+)
 SPILL_BYTES = Gauge("opc_connector_spill_bytes", "Bytes actuales en el buffer de spill en disco")
 SPILL_FILES = Gauge("opc_connector_spill_files", "Número de segmentos de spill en disco")
 SPILL_CAPACITY_BYTES = Gauge(

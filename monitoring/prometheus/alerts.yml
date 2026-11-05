@@ -220,6 +220,42 @@ groups:
             El p95 del apagado supera 24 s (80% de SHUTDOWN_TIMEOUT_S=30 s).
             Aumentar el timeout o investigar el drenado del spill.
 
+      - alert: OpcConnectorSpillWriteErrors
+        expr: increase(opc_connector_spill_write_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Errores de escritura en el spill ({{ $labels.instance }})"
+          description: >-
+            El worker no puede escribir/aplicar el cap en disco (lleno, permisos
+            o I/O). Los lotes se reintentan en un backlog acotado; si persiste,
+            se descartarán de forma visible. Revisar el volumen de spill.
+
+      - alert: OpcConnectorSpillFsyncErrors
+        expr: increase(opc_connector_spill_fsync_errors_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Fallos de fsync en el spill ({{ $labels.instance }})"
+          description: >-
+            flush/fsync falla: la durabilidad de los datos en disco no está
+            garantizada ante una caída. Revisar el dispositivo/volumen y el log
+            `spill_fsync_failed`.
+
+      - alert: OpcConnectorSpillRecordsDropped
+        expr: increase(opc_connector_spill_dropped_records_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Registros descartados por fallo de disco ({{ $labels.instance }})"
+          description: >-
+            Se agotó el backlog de reintento del spill y se han descartado
+            registros. Pérdida de datos: revisar capacidad/salud del volumen y
+            el SLA de pérdida.
+
       - alert: OpcConnectorReconnectionsHigh
         expr: rate(opc_connector_opc_reconnections_total[5m]) > 1
         for: 10m

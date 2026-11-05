@@ -3,6 +3,7 @@
 import asyncio
 from types import SimpleNamespace
 
+import asyncpg
 import pytest
 
 from connector.db.spill import ReplayBatch, ReplayToken
@@ -223,4 +224,38 @@ async def test_replay_nacks_on_failure_without_requeue():
 
     assert spill.acked == []
     assert spill.nacked == [[token]]
+    assert writer._queue.empty()
+
+
+# ── Fase 5: el fallback por violación única debe ejecutarse ─────────────────
+
+class _UniqueViolationConn:
+    """COPY falla como si existiera un índice único preexistente."""
+
+    async def copy_records_to_table(self, table, *, records, columns):
+        raise asyncpg.UniqueViolationError("duplicate key value")
+
+
+@pytest.mark.asyncio
+async def test_unique_violation_falls_back_to_dedup_without_requeue():
+    cfg = SimpleNamespace(
+        data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
+        dedup_enabled=False,
+    )
+    writer = BatchWriter(
+        pool=_Pool(_UniqueViolationConn()), cfg=cfg, queue=asyncio.Queue(),
+    )
+    calls = []
+
+    async def fake_insert_dedup(conn, batch):
+        calls.append(len(batch))
+        return len(batch)
+
+    writer._insert_dedup = fake_insert_dedup  # type: ignore[assignment]
+    batch = [(i,) for i in range(3)]
+
+    ok = await writer._flush(batch, requeue_on_failure=False)
+
+    assert ok is True
+    assert calls == [3]
     assert writer._queue.empty()

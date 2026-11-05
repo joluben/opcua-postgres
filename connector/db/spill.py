@@ -129,6 +129,10 @@ _PENDING_MAX = 100_000
 _WRITE_BATCH = 1_000
 # Timeout de drain síncrono (tests) y async (writer).
 _DRAIN_TIMEOUT_S = 15.0
+# Backlog de reintento ante errores de disco. Acotado para no crecer sin límite:
+# si se llena, se descarta lo más antiguo de forma visible (métrica + log).
+_RETRY_BACKOFF_BASE_S = 0.1
+_RETRY_BACKOFF_MAX_S = 5.0
 
 
 @dataclass(frozen=True)
@@ -201,6 +205,9 @@ class SpillBuffer:
         # Estado visible desde el loop (solo lectura; lo actualiza el worker).
         # Lectura/escritura de bool/int es atómica bajo GIL: eventual-consistente.
         self._disk_has_data = False
+        # Si el worker detecta un fallo de disco, write() deja de aceptar
+        # registros para que el llamador aplique una política visible.
+        self._disk_healthy = True
         self._closed = False
         try:
             metrics.SPILL_CAPACITY_BYTES.set(self.max_bytes if self.enabled else 0)
@@ -220,6 +227,13 @@ class SpillBuffer:
         # Tokens leídos pendientes de ACK (solo worker). Evita doble entrega.
         self._inflight: Optional[List[ReplayToken]] = None
         self._inflight_records = 0
+        # Backlog de lotes que no se pudieron escribir (solo worker). Se
+        # reintenta con backoff; si desborda, se descarta lo más antiguo con
+        # métrica y log explícitos (nunca pérdida silenciosa).
+        self._retry_backlog: List[Record] = []
+        self._retry_max = _PENDING_MAX
+        self._retry_attempts = 0
+        self._retry_after = 0.0
         try:
             metrics.SPILL_REPLAY_PENDING.set(0)
         except Exception:  # noqa: BLE001
@@ -258,6 +272,11 @@ class SpillBuffer:
         interna está llena (el llamador aplica drop-oldest).
         """
         if not self.enabled or self._closed or self._pending is None:
+            return False
+        if not self._disk_healthy:
+            # Disco no disponible: rechazar de forma visible para que el
+            # llamador aplique drop-oldest (VALUES_DROPPED) en vez de aceptar
+            # un registro que se perdería en silencio.
             return False
         try:
             self._pending.put_nowait(record)
@@ -379,14 +398,17 @@ class SpillBuffer:
         try:
             self._w_open_new_segment()
         except OSError as exc:
-            log.error("spill_open_failed", error=str(exc), dir=str(self.dir))
-            return
+            # No matar el worker: se reintentará al escribir y en _w_retry_pending.
+            self._w_note_disk_error("open", exc, count=0)
         self._w_update_metrics()
         self._w_refresh_disk_flag()
         last_housekeeping = time.monotonic()
 
         while True:
             try:
+                # 0) Reintentar el backlog de escrituras fallidas (con backoff).
+                self._w_retry_pending()
+
                 # 1) Volcar escrituras pendientes en lote (con timeout corto para
                 #    atender peticiones de drain/flush aunque no haya writes).
                 batch = self._collect_pending(timeout_s=0.05)
@@ -418,17 +440,33 @@ class SpillBuffer:
             tail = self._collect_pending(timeout_s=0.0)
             if tail:
                 self._w_write_batch(tail)
+            # En apagado no se respeta el backoff: último intento de vaciar el
+            # backlog antes de contabilizar lo que quede como descartado.
+            while self._retry_backlog:
+                before = len(self._retry_backlog)
+                self._w_retry_pending(force=True)
+                if len(self._retry_backlog) >= before:
+                    break
+            if self._retry_backlog:
+                # Último intento fallido: la pérdida debe quedar contabilizada.
+                dropped = len(self._retry_backlog)
+                self._retry_backlog.clear()
+                try:
+                    metrics.SPILL_DROPPED_RECORDS.inc(dropped)
+                except Exception:  # noqa: BLE001
+                    pass
+                log.error(
+                    "spill_shutdown_backlog_dropped",
+                    records=dropped,
+                    action="dropped",
+                )
             self._serve_requests()  # drenar peticiones restantes antes de salir
             if self._cur_file:
-                try:
-                    self._cur_file.flush()
-                    os.fsync(self._cur_file.fileno())
-                except OSError:
-                    pass
+                self._w_fsync_cur(stage="shutdown")
                 try:
                     self._cur_file.close()
-                except OSError:
-                    pass
+                except OSError as exc:
+                    log.warning("spill_close_failed", error=str(exc))
                 self._cur_file = None
             self._w_update_metrics()
             self._w_refresh_disk_flag()
@@ -636,68 +674,226 @@ class SpillBuffer:
 
     def _w_rotate(self) -> None:
         if self._cur_file:
-            try:
-                self._cur_file.flush()
-                os.fsync(self._cur_file.fileno())
-            except OSError:
-                pass
+            self._w_fsync_cur(stage="rotate")
             try:
                 self._cur_file.close()
-            except OSError:
-                pass
+            except OSError as exc:
+                log.warning("spill_close_failed", error=str(exc), stage="rotate")
         self._w_open_new_segment()
+
+    def _w_fsync_cur(self, *, stage: str) -> bool:
+        """flush + fsync del segmento actual.
+
+        Un fallo se contabiliza y deja el disco como no sano; no se silencia.
+        """
+        if not self._cur_file:
+            return True
+        try:
+            self._cur_file.flush()
+            os.fsync(self._cur_file.fileno())
+        except OSError as exc:
+            self._disk_healthy = False
+            try:
+                metrics.SPILL_FSYNC_ERRORS.inc()
+            except Exception:  # noqa: BLE001
+                pass
+            log.error(
+                "spill_fsync_failed",
+                stage=stage,
+                error=str(exc),
+                error_type=type(exc).__name__,
+                action="unhealthy",
+            )
+            return False
+        self._writes_since_fsync = 0
+        return True
 
     def _w_flush_cur(self) -> None:
         if self._cur_file:
-            try:
-                self._cur_file.flush()
-                os.fsync(self._cur_file.fileno())
-            except OSError:
-                pass
-            self._writes_since_fsync = 0
+            self._w_fsync_cur(stage="flush")
         self._w_update_metrics()
         self._w_refresh_disk_flag()
 
-    def _w_write_batch(self, batch: List[Record]) -> None:
-        if not batch or self._cur_file is None:
+    def _w_note_disk_error(self, stage: str, exc: OSError, *, count: int) -> None:
+        """Marca el disco como no sano y programa el siguiente reintento."""
+        self._disk_healthy = False
+        self._retry_attempts += 1
+        delay = min(
+            _RETRY_BACKOFF_MAX_S,
+            _RETRY_BACKOFF_BASE_S * (2 ** min(self._retry_attempts, 10)),
+        )
+        self._retry_after = time.monotonic() + delay
+        try:
+            metrics.SPILL_WRITE_ERRORS.inc()
+        except Exception:  # noqa: BLE001
+            pass
+        log.error(
+            "spill_write_failed",
+            stage=stage,
+            error=str(exc),
+            error_type=type(exc).__name__,
+            records=count,
+            retry_in_s=round(delay, 2),
+            action="retry",
+        )
+
+    def _w_enqueue_retry(self, records: List[Record], *, front: bool) -> None:
+        """Guarda un lote para reintentarlo, acotando el backlog.
+
+        Si desborda se descarta lo más antiguo de forma visible (métrica y log),
+        nunca en silencio.
+        """
+        if not records:
+            return
+        if front:
+            self._retry_backlog[0:0] = records
+        else:
+            self._retry_backlog.extend(records)
+        overflow = len(self._retry_backlog) - self._retry_max
+        if overflow > 0:
+            dropped = self._retry_backlog[:overflow]
+            del self._retry_backlog[:overflow]
+            try:
+                metrics.SPILL_DROPPED_RECORDS.inc(len(dropped))
+            except Exception:  # noqa: BLE001
+                pass
+            log.error(
+                "spill_retry_backlog_full",
+                dropped=len(dropped),
+                backlog=len(self._retry_backlog),
+                action="dropped_oldest",
+            )
+
+    def _w_retry_pending(self, *, force: bool = False) -> None:
+        """Reintenta el backlog si toca (backoff exponencial acotado)."""
+        if not self._retry_backlog:
+            if not self._disk_healthy:
+                self._disk_healthy = True
+                self._retry_attempts = 0
+                self._retry_after = 0.0
+                log.info("spill_disk_recovered", backlog=0)
+            return
+        if not force and time.monotonic() < self._retry_after:
+            return
+        chunk = self._retry_backlog[:_WRITE_BATCH]
+        del self._retry_backlog[:len(chunk)]
+        if self._w_write_batch(chunk, requeue_on_failure=False):
+            if not self._retry_backlog:
+                self._retry_attempts = 0
+                self._retry_after = 0.0
+                self._disk_healthy = True
+                log.info("spill_disk_recovered", backlog=0)
+        else:
+            # Sigue caído: conservar el orden FIFO (este lote es el más antiguo).
+            self._w_enqueue_retry(chunk, front=True)
+
+    def _w_write_batch(
+        self, batch: List[Record], *, requeue_on_failure: bool = True
+    ) -> bool:
+        """Escribe un lote en disco. Nunca pierde registros sin dejar constancia.
+
+        Devuelve True si el lote se escribió. Ante cualquier ``OSError`` el lote
+        se guarda en el backlog de reintento (o se contabiliza como descartado),
+        se incrementa la métrica correspondiente y se registra un log.
+        """
+        if not batch:
+            return True
+        if self._cur_file is None:
             # Si el fichero se perdió, intentar reabrir una vez.
             try:
                 self._w_open_new_segment()
-            except OSError:
-                return
+            except OSError as exc:
+                self._w_note_disk_error("open", exc, count=len(batch))
+                if requeue_on_failure:
+                    self._w_enqueue_retry(batch, front=False)
+                return False
         if self._cur_size >= self.segment_bytes:
-            self._w_rotate()
-        try:
-            chunks: List[str] = []
-            for r in batch:
-                try:
-                    payload = _dumps(_encode(r))
-                except Exception:  # noqa: BLE001 - registro no serializable: saltar
-                    continue
-                chunks.append(payload.decode("utf-8") if isinstance(payload, bytes) else str(payload))
-            if not chunks:
-                return
-            blob = "".join(chunks)
-            self._cur_file.write(blob)
-            self._cur_size += len(blob.encode("utf-8"))
-            self._writes_since_fsync += len(chunks)
-            # Marcar disponibilidad de inmediato (has_data() es cacheado y el
-            # refresh periódico es cada 1s; sin esto hay una ventana donde lo
-            # pendiente ya se consumió pero el flag aún es False).
-            self._disk_has_data = True
             try:
-                metrics.SPILL_WRITTEN.inc(len(chunks))
-            except Exception:  # noqa: BLE001
-                pass
-            if self._writes_since_fsync >= self.fsync_every:
+                self._w_rotate()
+            except OSError as exc:
+                self._w_note_disk_error("rotate", exc, count=len(batch))
+                if requeue_on_failure:
+                    self._w_enqueue_retry(batch, front=False)
+                return False
+
+        chunks: List[str] = []
+        for r in batch:
+            try:
+                payload = _dumps(_encode(r))
+            except Exception as exc:  # noqa: BLE001 - registro no serializable
                 try:
-                    self._cur_file.flush()
-                    os.fsync(self._cur_file.fileno())
-                except OSError:
+                    metrics.SPILL_SERIALIZATION_ERRORS.inc()
+                except Exception:  # noqa: BLE001
                     pass
-                self._writes_since_fsync = 0
-        except OSError:
+                log.error(
+                    "spill_serialization_failed",
+                    error=str(exc),
+                    error_type=type(exc).__name__,
+                    action="dropped",
+                )
+                continue
+            chunks.append(
+                payload.decode("utf-8") if isinstance(payload, bytes) else str(payload)
+            )
+        if not chunks:
+            # Todos los registros fallaron al serializar: ya contabilizados.
+            return True
+
+        blob = "".join(chunks)
+        offset_before = self._cur_size
+        try:
+            self._cur_file.write(blob)
+        except OSError as exc:
+            # Puede haber quedado una escritura parcial: truncar al offset
+            # anterior para que el reintento no genere una línea corrupta.
+            self._w_discard_partial_write(offset_before)
+            self._w_note_disk_error("write", exc, count=len(chunks))
+            if requeue_on_failure:
+                self._w_enqueue_retry(batch, front=False)
+            return False
+
+        self._cur_size += len(blob.encode("utf-8"))
+        self._writes_since_fsync += len(chunks)
+        # Marcar disponibilidad de inmediato (has_data() es cacheado y el
+        # refresh periódico es cada 1s; sin esto hay una ventana donde lo
+        # pendiente ya se consumió pero el flag aún es False).
+        self._disk_has_data = True
+        self._disk_healthy = True
+        try:
+            metrics.SPILL_WRITTEN.inc(len(chunks))
+        except Exception:  # noqa: BLE001
+            pass
+        if self._writes_since_fsync >= self.fsync_every:
+            self._w_fsync_cur(stage="write")
+        return True
+
+    def _w_refresh_cur_size(self) -> None:
+        """Recalcula ``_cur_size`` tras un fallo de escritura parcial."""
+        if self._cur_path is None:
             return
+        try:
+            self._cur_size = self._cur_path.stat().st_size
+        except OSError:
+            pass
+
+    def _w_discard_partial_write(self, offset: int) -> None:
+        """Trunca el segmento al offset previo a una escritura fallida."""
+        if self._cur_file is None:
+            self._w_refresh_cur_size()
+            return
+        try:
+            try:
+                self._cur_file.flush()
+            except OSError:
+                pass
+            self._cur_file.truncate(offset)
+            try:
+                self._cur_file.seek(0, os.SEEK_END)
+            except OSError:
+                pass
+            self._cur_size = offset
+        except (OSError, ValueError, AttributeError):
+            self._w_refresh_cur_size()
 
     def _w_drain(self, max_n: int) -> ReplayBatch:
         """Lectura no destructiva FIFO (solo worker).
