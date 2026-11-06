@@ -117,14 +117,80 @@ async def test_insert_dedup_uses_stage_and_on_conflict():
 
     assert inserted == 2
     assert conn.transactions == 1
-    assert conn.copied[0] == "_opc_ingest_stage"
+    assert conn.copied[0].startswith("_opc_ingest_stage_w0_")
     assert conn.copied[2] == _COLUMNS
     create_sql = [q for q in conn.executed if "CREATE TEMP TABLE" in q]
     assert create_sql and "ON COMMIT DROP" in create_sql[0]
+    # Sin IF NOT EXISTS: el nombre es único por intento, no se reutiliza staging.
+    assert "IF NOT EXISTS" not in create_sql[0]
     assert not any("TRUNCATE" in q for q in conn.executed)
     insert_sql = [q for q in conn.executed if q.startswith("INSERT INTO")]
-    assert insert_sql and "ON CONFLICT (event_id, ts)" in insert_sql[0]
+    assert insert_sql
+    assert "ON CONFLICT (event_id, ts) WHERE event_id IS NOT NULL" in insert_sql[0]
     assert "DO NOTHING" in insert_sql[0]
+    # El COMMIT limpia vía ON COMMIT DROP: no se paga un DROP extra en el camino feliz.
+    assert not any(q.startswith("DROP TABLE") for q in conn.executed)
+
+
+class _FailingDedupConn(_DedupConn):
+    async def fetch(self, query, *args):
+        self.executed.append(query)
+        raise RuntimeError("copy cancelado")
+
+
+@pytest.mark.asyncio
+async def test_insert_dedup_drops_stage_when_transaction_fails():
+    cfg = SimpleNamespace(
+        data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
+        dedup_enabled=True,
+    )
+    writer = BatchWriter(pool=None, cfg=cfg, queue=asyncio.Queue())
+    conn = _FailingDedupConn()
+
+    with pytest.raises(RuntimeError):
+        await writer._insert_dedup(conn, [(i,) for i in range(3)])
+
+    drops = [q for q in conn.executed if q.startswith("DROP TABLE IF EXISTS")]
+    assert drops == [f"DROP TABLE IF EXISTS {conn.copied[0]}"]
+
+
+@pytest.mark.asyncio
+async def test_insert_dedup_uses_unique_stage_table_per_attempt():
+    cfg = SimpleNamespace(
+        data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
+        dedup_enabled=True,
+    )
+    writer = BatchWriter(pool=None, cfg=cfg, queue=asyncio.Queue())
+    conn = _DedupConn()
+
+    await writer._insert_dedup(conn, [(1,)])
+    first = conn.copied[0]
+    await writer._insert_dedup(conn, [(2,)])
+
+    assert conn.copied[0] != first
+
+
+@pytest.mark.asyncio
+async def test_drop_stage_swallow_errors_but_not_cancellation():
+    class _BrokenConn:
+        async def execute(self, query, *args):
+            raise ConnectionResetError("conexión perdida")
+
+    writer = BatchWriter(
+        pool=None,
+        cfg=SimpleNamespace(data_table="t", batch_size=10, flush_interval_ms=500),
+        queue=asyncio.Queue(),
+    )
+
+    # No debe propagar el fallo del DROP (la garantía real es ON COMMIT DROP).
+    await writer._drop_stage(_BrokenConn(), "_opc_ingest_stage_w0_1")
+
+    class _CancelledConn:
+        async def execute(self, query, *args):
+            raise asyncio.CancelledError()
+
+    with pytest.raises(asyncio.CancelledError):
+        await writer._drop_stage(_CancelledConn(), "_opc_ingest_stage_w0_2")
 
 
 @pytest.mark.asyncio

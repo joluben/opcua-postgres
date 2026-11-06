@@ -6,9 +6,17 @@
 -- 1. Extensión TimescaleDB (requiere privilegios de superusuario)
 CREATE EXTENSION IF NOT EXISTS timescaledb;
 
--- 2. Usuario de aplicación con permisos mínimos
+-- 2. Usuario de aplicación con permisos mínimos (idempotente)
 --    Sustituir 'SECRET' por la contraseña real (o gestionar vía secret manager).
-CREATE USER connector_user WITH PASSWORD 'SECRET';
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'connector_user'
+    ) THEN
+        CREATE ROLE connector_user LOGIN PASSWORD 'SECRET';
+    END IF;
+END
+$$;
 
 GRANT CONNECT ON DATABASE scada_db TO connector_user;
 -- PostgreSQL 15+ ya no concede CREATE sobre el schema public a PUBLIC.

@@ -22,6 +22,17 @@ PG_ADMIN_PASSWORD="${PG_ADMIN_PASSWORD:-admin}"
 PG_APP_PASSWORD="${PG_APP_PASSWORD:-acceptance}"
 PYTHON="${PYTHON:-python3}"
 
+# WSL no propaga variables arbitrarias a un python.exe de Windows salvo que se
+# declaren en WSLENV. Sin esto, pytest no vería ACCEPTANCE_*_DSN y todos los
+# tests se saltarían en silencio (falso verde).
+case "$PYTHON" in
+  *.exe|*.EXE)
+    if grep -qi microsoft /proc/version 2>/dev/null; then
+      export WSLENV="${WSLENV:+$WSLENV:}ACCEPTANCE_ADMIN_DSN:ACCEPTANCE_CONNECTOR_DSN:PYTHONPATH"
+    fi
+    ;;
+esac
+
 cleanup() {
   docker rm -f "$PG_CONTAINER" >/dev/null 2>&1 || true
 }
@@ -50,8 +61,26 @@ if [ "$ready" -ne 1 ]; then
 fi
 
 echo "Aplicando scripts/dba_setup.sql como DBA..."
-sed "s/PASSWORD 'SECRET'/PASSWORD '${PG_APP_PASSWORD}'/" scripts/dba_setup.sql \
-  | docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d scada_db >/dev/null
+setup_ok=0
+setup_err="$(mktemp)"
+for _ in $(seq 1 10); do
+  if sed "s/PASSWORD 'SECRET'/PASSWORD '${PG_APP_PASSWORD}'/" scripts/dba_setup.sql \
+      | docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d scada_db \
+      >/dev/null 2>"$setup_err"; then
+    setup_ok=1
+    break
+  fi
+  # El entrypoint de la imagen puede seguir creando la extensión en paralelo;
+  # reintentar es seguro porque dba_setup.sql es idempotente.
+  sleep 1
+done
+if [ "$setup_ok" -ne 1 ]; then
+  echo "ERROR: no se pudo aplicar dba_setup.sql" >&2
+  cat "$setup_err" >&2 || true
+  rm -f "$setup_err"
+  exit 1
+fi
+rm -f "$setup_err"
 
 echo "Ejecutando pruebas de aceptación con connector_user..."
 ACCEPTANCE_ADMIN_DSN="postgresql://postgres:${PG_ADMIN_PASSWORD}@localhost:${PG_PORT}/scada_db" \

@@ -22,6 +22,8 @@ at-least-once, pero la clave única lo hace idempotente.
 from __future__ import annotations
 
 import asyncio
+import itertools
+import re
 import time
 import uuid
 from datetime import datetime, timezone
@@ -44,12 +46,18 @@ _COLUMNS = [
 ]
 _COLUMNS_SQL = ", ".join(_COLUMNS)
 
-# Tabla TEMP por conexión (cada conexión del pool tiene la suya). Se crea
-# dentro de una transacción con ON COMMIT DROP: al confirmar el lote desaparece,
-# sin necesidad de TRUNCATE ni de limpiar restos de un intento fallido.
-_STAGE_TABLE = "_opc_ingest_stage"
-_STAGE_DDL = f"""
-    CREATE TEMP TABLE IF NOT EXISTS {_STAGE_TABLE} (
+# Tabla TEMP de staging. Las tablas temporales son por sesión, pero la conexión
+# se reutiliza desde el pool: por eso cada intento usa un nombre único (contador
+# monotónico + id de worker). Así un staging huérfano de un intento anterior
+# (COPY cancelado, conexión rota a mitad de transacción) nunca se reutiliza ni
+# colisiona con el intento siguiente, y no hace falta IF NOT EXISTS.
+#
+# ON COMMIT DROP se evalúa en el servidor al terminar la transacción, tanto en
+# COMMIT como en ROLLBACK: es la garantía primaria y no depende de que Python
+# llegue a ejecutar código de limpieza (cancelación de tarea incluida).
+_STAGE_TABLE_PREFIX = "_opc_ingest_stage"
+_STAGE_DDL = """
+    CREATE TEMP TABLE {name} (
         event_id     UUID,
         tag_id       INTEGER,
         ts           TIMESTAMPTZ,
@@ -59,6 +67,24 @@ _STAGE_DDL = f"""
         connector_id TEXT
     ) ON COMMIT DROP
 """
+_stage_seq = itertools.count(1)
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _ident(name: str) -> str:
+    """Valida un identificador generado internamente antes de interpolarlo en SQL."""
+    if not _IDENT_RE.match(name):
+        raise ValueError(f"identificador SQL inválido: {name!r}")
+    return name
+
+
+def _new_stage_table(worker_id: int = 0) -> str:
+    """Nombre único de staging para un único intento de inserción.
+
+    El sufijo hexadecimal crece de forma monotónica: dos intentos sobre la misma
+    conexión del pool nunca comparten tabla, aunque el anterior no se limpiara.
+    """
+    return _ident(f"{_STAGE_TABLE_PREFIX}_w{int(worker_id)}_{next(_stage_seq):x}")
 
 
 def _rows_affected(status: str) -> int:
@@ -289,22 +315,43 @@ class BatchWriter:
     async def _insert_dedup(self, conn: asyncpg.Connection, batch: List[Record]) -> int:
         """Copia a una tabla TEMP e inserta con ``ON CONFLICT DO NOTHING``.
 
-        Todo ocurre en una única transacción: la tabla de staging se crea con
-        ``ON COMMIT DROP`` y desaparece al confirmar. Si el COPY o el INSERT
-        fallan, la transacción revierte y no queda estado parcial en la conexión.
+        Todo ocurre en una única transacción. Seguridad del staging cuando
+        conviven varios writers (``POSTGRES_NUM_WRITERS > 1``) y las conexiones
+        se reciclan desde el pool:
+
+        1. Nombre único por intento (``_new_stage_table``): un intento posterior
+           en la misma conexión física no puede reutilizar una tabla huérfana.
+        2. ``ON COMMIT DROP``: PostgreSQL elimina la tabla al CONFIRMAR y al
+           REVERTIR, así que un COPY fallido o una sentencia cancelada no deja
+           restos, aunque la tarea se cancele o la conexión se corte después.
+        3. ``DROP TABLE IF EXISTS`` en el ``finally``: red de seguridad para el
+           caso en que el bloque transaccional no llegó a finalizar (conexión
+           caída, cancelación durante el ``COMMIT``). Es *best-effort*: nunca
+           propaga su propio error para no enmascarar el original; si la
+           conexión está rota, el pool la descarta y con ella su sesión.
+
         Devuelve las filas realmente insertadas.
         """
-        async with conn.transaction():
-            await conn.execute(_STAGE_DDL)
-            await conn.copy_records_to_table(
-                _STAGE_TABLE, records=batch, columns=_COLUMNS
-            )
-            inserted_rows = await conn.fetch(
-                f"INSERT INTO {self._table} ({_COLUMNS_SQL}) "
-                f"SELECT {_COLUMNS_SQL} FROM {_STAGE_TABLE} "
-                f"ON CONFLICT (event_id, ts) WHERE event_id IS NOT NULL DO NOTHING "
-                f"RETURNING 1"
-            )
+        stage = _new_stage_table(self._worker_id)
+        committed = False
+        try:
+            async with conn.transaction():
+                await conn.execute(_STAGE_DDL.format(name=stage))
+                await conn.copy_records_to_table(
+                    stage, records=batch, columns=_COLUMNS
+                )
+                inserted_rows = await conn.fetch(
+                    f"INSERT INTO {self._table} ({_COLUMNS_SQL}) "
+                    f"SELECT {_COLUMNS_SQL} FROM {stage} "
+                    f"ON CONFLICT (event_id, ts) WHERE event_id IS NOT NULL "
+                    f"DO NOTHING RETURNING 1"
+                )
+            committed = True
+        finally:
+            # Si el COMMIT se completó, ON COMMIT DROP ya eliminó la tabla: no se
+            # gasta un round-trip extra en el camino feliz.
+            if not committed:
+                await self._drop_stage(conn, stage)
         inserted = len(inserted_rows)
         duplicates = len(batch) - inserted
         if duplicates > 0:
@@ -313,6 +360,27 @@ class BatchWriter:
             except Exception:  # noqa: BLE001
                 pass
         return inserted
+
+    async def _drop_stage(self, conn: asyncpg.Connection, stage: str) -> None:
+        """Elimina la tabla de staging fuera de la transacción (best-effort).
+
+        Se ejecuta después de que el contexto transaccional haya terminado, por
+        lo que la conexión ya está en autocommit (o descartada por el pool): un
+        ``DROP`` sobre una transacción abortada no tendría efecto. Los errores
+        se registran y se ignoran deliberadamente; la garantía fuerte la da
+        ``ON COMMIT DROP``. ``CancelledError`` se propaga para no romper la
+        semántica de cancelación de ``wait_for``/``timeout``.
+        """
+        try:
+            await conn.execute(f"DROP TABLE IF EXISTS {_ident(stage)}")
+        except asyncio.CancelledError:
+            log.warning("stage_table_drop_cancelled", table=stage,
+                        worker=self._worker_id)
+            raise
+        except Exception as exc:  # noqa: BLE001
+            log.warning("stage_table_drop_failed", table=stage,
+                        worker=self._worker_id, error=str(exc),
+                        error_type=type(exc).__name__)
 
     def _requeue(self, batch: List[Record]) -> None:
         for item in batch:
