@@ -30,8 +30,6 @@ services:
       - .env                      # POSTGRES_HOST, OPC_SERVER_URL y resto de config no sensible
     environment:
       CONNECTOR_ID: connector-01
-      OPC_TAG_OFFSET: "0"
-      OPC_TAG_LIMIT: "5000"
       # ── Seguridad ────────────────────────────────────────────────────────
       # Las credenciales se inyectan vía Docker Secrets (convención *_FILE).
       # NUNCA poner contraseñas en claro en este fichero ni en .env versionado.

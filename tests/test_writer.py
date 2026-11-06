@@ -203,6 +203,33 @@ def _writer_with(spill, conn, *, dedup=False):
 
 
 @pytest.mark.asyncio
+async def test_flush_updates_health_state():
+    from connector.utils import metrics
+
+    cfg = SimpleNamespace(
+        data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
+        dedup_enabled=False,
+    )
+    health = metrics.HealthState()
+    writer = BatchWriter(
+        pool=_Pool(_CopyConn()), cfg=cfg, queue=asyncio.Queue(), health=health,
+    )
+    assert health.db_connected is False
+
+    ok = await writer._flush([("r",)], requeue_on_failure=False)
+    assert ok is True
+    assert health.db_connected is True
+
+    failing = BatchWriter(
+        pool=_Pool(_CopyConn(fail=True)), cfg=cfg, queue=asyncio.Queue(),
+        health=health,
+    )
+    ok = await failing._flush([("r",)], requeue_on_failure=False)
+    assert ok is False
+    assert health.db_connected is False
+
+
+@pytest.mark.asyncio
 async def test_replay_acks_only_after_successful_flush():
     token = ReplayToken("spill-1.jsonl", 10)
     spill = _ReplaySpill(ReplayBatch(records=[("r",)], tokens=[token]))

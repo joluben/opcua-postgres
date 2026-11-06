@@ -256,6 +256,31 @@ groups:
             registros. Pérdida de datos: revisar capacidad/salud del volumen y
             el SLA de pérdida.
 
+      - alert: OpcConnectorHistoryGapUnrecovered
+        expr: increase(opc_connector_history_gap_unrecovered_total[15m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Huecos de datos no recuperados tras reconexión ({{ $labels.instance }})"
+          description: >-
+            Tras una reconexión no se pudo recuperar el histórico de algún tag
+            (sin histórico, nodo no historizado, error o hueco mayor que
+            HISTORY_RECOVERY_MAX_GAP_S). Revisar el log `history_gap` por tag.
+
+      - alert: OpcConnectorHistoryReadErrors
+        expr: >-
+          rate(opc_connector_history_read_total{result=~"error|unsupported"}[15m])
+          > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "HistoryRead con errores o no soportado ({{ $labels.instance }})"
+          description: >-
+            La recuperación histórica falla de forma sostenida. Verificar que el
+            servidor OPC soporta HistoryRead y que los nodos están historizados.
+
       - alert: OpcConnectorReconnectionsHigh
         expr: rate(opc_connector_opc_reconnections_total[5m]) > 1
         for: 10m

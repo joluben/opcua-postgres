@@ -109,6 +109,58 @@ async def test_writers_stopped_when_discovery_fails(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_opc_health_only_after_subscription(monkeypatch):
+    """La sesión OPC no cuenta como sana hasta que la suscripción está activa."""
+    pool = FakePool()
+    client = SimpleNamespace()
+
+    async def fake_create_pool(_cfg):
+        return pool
+
+    async def fake_initialize_schema(_pool, _cfg):
+        return None
+
+    async def fake_connect(_cfg):
+        return client
+
+    async def fake_discover(*_args, **_kwargs):
+        return []
+
+    observed = {}
+
+    async def fake_subscribe(*_args, **_kwargs):
+        observed["during_subscribe"] = health.opc_connected
+
+    async def fake_wait(_client, stop_event):
+        observed["after_subscribe"] = health.opc_connected
+        stop_event.set()
+
+    async def fake_disconnect(self=None):
+        return None
+
+    client.disconnect = fake_disconnect
+
+    monkeypatch.setattr(main_mod.db_pool, "create_pool", fake_create_pool)
+    monkeypatch.setattr(main_mod, "initialize_schema", fake_initialize_schema)
+    monkeypatch.setattr(main_mod.opc_client, "connect", fake_connect)
+    monkeypatch.setattr(main_mod, "discover_and_partition", fake_discover)
+    monkeypatch.setattr(main_mod, "subscribe", fake_subscribe)
+    monkeypatch.setattr(main_mod, "_wait_until_disconnected", fake_wait)
+
+    health = main_mod.metrics.HealthState()
+    await main_mod._run_opc_session(
+        _cfg(history_recovery_enabled=False), asyncio.Queue(), health, None,
+        asyncio.Event(),
+    )
+
+    assert observed["during_subscribe"] is False
+    assert observed["after_subscribe"] is True
+    # Al terminar la sesión vuelve a degradado.
+    assert health.opc_connected is False
+    assert health.db_connected is False
+
+
+@pytest.mark.asyncio
 async def test_wait_until_disconnected_honours_stop_event():
     class FakeClient:
         def __init__(self) -> None:

@@ -23,6 +23,9 @@ services:
       CONNECTOR_ID: connector-01
       OPC_TAG_OFFSET: "0"
       OPC_TAG_LIMIT: "5000"
+      # El escalado particiona el catálogo a propósito: el recorte por partición
+      # se registra como warning en vez de abortar.
+      OPC_ALLOW_TAG_OMISSION: "true"
     ports:
       - "8001:8000"
 
@@ -35,6 +38,9 @@ services:
       CONNECTOR_ID: connector-02
       OPC_TAG_OFFSET: "5000"
       OPC_TAG_LIMIT: "5000"
+      # El escalado particiona el catálogo a propósito: el recorte por partición
+      # se registra como warning en vez de abortar.
+      OPC_ALLOW_TAG_OMISSION: "true"
     ports:
       - "8002:8000"
 
@@ -47,6 +53,9 @@ services:
       CONNECTOR_ID: connector-03
       OPC_TAG_OFFSET: "10000"
       OPC_TAG_LIMIT: "5000"
+      # El escalado particiona el catálogo a propósito: el recorte por partición
+      # se registra como warning en vez de abortar.
+      OPC_ALLOW_TAG_OMISSION: "true"
     ports:
       - "8003:8000"
 
@@ -59,5 +68,8 @@ services:
       CONNECTOR_ID: connector-04
       OPC_TAG_OFFSET: "15000"
       OPC_TAG_LIMIT: "5000"
+      # El escalado particiona el catálogo a propósito: el recorte por partición
+      # se registra como warning en vez de abortar.
+      OPC_ALLOW_TAG_OMISSION: "true"
     ports:
       - "8004:8000"

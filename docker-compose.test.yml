@@ -70,8 +70,6 @@ services:
       OPC_SECURITY_MODE: "None"
       OPC_NAMESPACE_INDEX: "2"        # ns del simulador (SimTags)
       OPC_PUBLISH_INTERVAL_MS: "100"  # entrega más frecuente para acercarse a 10k val/s
-      OPC_TAG_OFFSET: "0"
-      OPC_TAG_LIMIT: "5000"
       # Base de datos local de pruebas
       POSTGRES_HOST: timescaledb
       POSTGRES_PORT: "5432"

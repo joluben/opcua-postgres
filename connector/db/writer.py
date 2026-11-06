@@ -92,11 +92,13 @@ class BatchWriter:
         queue: "asyncio.Queue[Record]",
         spill: SpillBuffer | None = None,
         worker_id: int = 0,
+        health: "metrics.HealthState | None" = None,
     ) -> None:
         self._pool = pool
         self._cfg = cfg
         self._queue = queue
         self._spill = spill
+        self._health = health
         self._table = getattr(cfg, "data_table", "opc_raw_values")
         self._batch_size = int(getattr(cfg, "batch_size", 1000))
         self._flush_s = float(getattr(cfg, "flush_interval_ms", 500)) / 1000.0
@@ -251,6 +253,8 @@ class BatchWriter:
             except Exception:  # noqa: BLE001
                 pass
             self._db_healthy = True
+            if self._health is not None:
+                self._health.db_connected = True
             log.info(
                 "batch_written",
                 rows=written,
@@ -268,6 +272,10 @@ class BatchWriter:
             except Exception:  # noqa: BLE001
                 pass
             self._db_healthy = False
+            if self._health is not None:
+                # /health no puede seguir devolviendo 200 si las escrituras
+                # fallan, aunque la conexión del pool siga viva.
+                self._health.db_connected = False
             log.error("batch_write_failed", rows=len(batch), error=str(exc),
                       error_type=type(exc).__name__, worker=self._worker_id)
             if requeue_on_failure:

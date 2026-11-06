@@ -15,7 +15,8 @@ def _base_env(monkeypatch):
     # P0: aislar de *_FILE del host para que los defaults fail-closed no hereden
     # ficheros inexistentes del entorno local.
     for var in ("OPC_PASSWORD_FILE", "POSTGRES_PASSWORD_FILE",
-                "OPC_CERTIFICATE_PATH", "OPC_PRIVATE_KEY_PATH"):
+                "OPC_CERTIFICATE_PATH", "OPC_PRIVATE_KEY_PATH",
+                "OPC_TAG_OFFSET", "OPC_TAG_LIMIT", "OPC_ALLOW_TAG_OMISSION"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("OPC_SECURITY_POLICY", raising=False)
     monkeypatch.delenv("OPC_DEADBAND_TYPE", raising=False)
@@ -76,3 +77,41 @@ def test_unknown_ssl_mode_rejected(monkeypatch):
     monkeypatch.setenv("POSTGRES_SSL_MODE", "super-secure-typo")
     with pytest.raises(ConfigError, match="POSTGRES_SSL_MODE"):
         Config.from_env()
+
+
+def test_tag_omission_is_not_allowed_by_default(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.delenv("OPC_TAG_OFFSET", raising=False)
+    monkeypatch.delenv("OPC_TAG_LIMIT", raising=False)
+    monkeypatch.delenv("OPC_ALLOW_TAG_OMISSION", raising=False)
+
+    cfg = Config.from_env()
+
+    assert cfg.opc.tag_offset == 0
+    assert cfg.opc.tag_limit == 5000
+    assert cfg.opc.allow_tag_omission is False
+
+
+def test_tag_omission_requires_explicit_opt_in(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    # Definir offset/limit NO debe habilitar el recorte silencioso.
+    monkeypatch.setenv("OPC_TAG_OFFSET", "0")
+    monkeypatch.setenv("OPC_TAG_LIMIT", "1000")
+    monkeypatch.delenv("OPC_ALLOW_TAG_OMISSION", raising=False)
+
+    cfg = Config.from_env()
+
+    assert cfg.opc.tag_limit == 1000
+    assert cfg.opc.allow_tag_omission is False
+
+
+def test_tag_omission_enabled_explicitly(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv("OPC_ALLOW_TAG_OMISSION", "true")
+
+    cfg = Config.from_env()
+
+    assert cfg.opc.allow_tag_omission is True

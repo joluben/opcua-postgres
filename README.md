@@ -212,6 +212,13 @@ crash no duplica filas. En CI se ejecuta en el job `integration`.
 - Cada conector toma su rango con `OPC_TAG_OFFSET` / `OPC_TAG_LIMIT` sobre el **orden
   estable del catálogo** (`ORDER BY node_id`). Ajustar el nº de conectores al throughput
   **real** de `asyncua` validado en el *spike* (plan §9.3/§14), no al teórico.
+- El descubrimiento es *fail-closed*: si hay más variables que las seleccionadas y
+  no se configuró `OPC_NODE_ID_FILTER`, `OPC_NAMESPACE_INDEX` ni
+  `OPC_ALLOW_TAG_OMISSION=true`, la sesión aborta en vez de dejar tags fuera en
+  silencio. Definir `OPC_TAG_OFFSET`/`OPC_TAG_LIMIT` **no** habilita el recorte:
+  solo el compose de escalado activa `OPC_ALLOW_TAG_OMISSION=true`. Los errores
+  de browse se registran por nodo (`opc_browse_error`) y se cuentan en
+  `opc_connector_browse_errors_total`.
 - Antes de escalar, verificar en el servidor OPC-UA: `MaxSessionCount` y
   `MaxMonitoredItemsPerSubscription`, y el licenciamiento por sesión.
 
@@ -274,7 +281,7 @@ versión antigua inserta `event_id=NULL`. Si se desactiva
 
 ### Mantenimiento
 - **Certificados OPC-UA:** validez recomendada ≤ 3 años. Alertar 30 días antes del vencimiento.
-- **Retención/compresión:** compresión automática > 7 días; configurar `add_retention_policy`
+- **Retención/compresión:** compresión automática > 1 mes; retención automática de 365 días (`add_retention_policy`)
   según necesidad. Dimensionar disco del host de BD por retención (plan §15.3).
 - **Reinicios:** `restart: unless-stopped`; tras agotar `RECONNECT_MAX_RETRIES`, el contenedor
   termina y Docker lo reinicia.

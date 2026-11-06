@@ -8,7 +8,6 @@ y se encola con ``put_nowait``. Si el buffer está lleno, se aplica *drop-oldest
 from __future__ import annotations
 
 import asyncio
-import uuid
 from datetime import datetime, timezone
 from typing import Dict, List
 
@@ -17,6 +16,7 @@ from asyncua import Client, ua
 from ..config import OpcConfig
 from ..db.spill import SpillBuffer, enqueue_or_spill
 from ..utils import metrics
+from ..utils.event_id import deterministic_event_id
 from ..utils.logger import get_logger
 from .browser import Tag
 
@@ -85,10 +85,13 @@ class SubHandler:
         else:
             value_num, value_str = None, None if val is None else str(val)
 
-        # event_id generado una sola vez en la ingesta y persistido en el spill:
-        # permite deduplicar replays (at-least-once) con una clave única en BD.
+        # event_id determinista (contenido) para que la recuperación histórica
+        # y el replay del spill dedupliquen con la misma clave, incluso si el
+        # mismo dato se entrega dos veces por solape tiempo real/histórico.
         record = (
-            uuid.uuid4(),
+            deterministic_event_id(
+                tag_id, ts, value_num, value_str, int(status), self._connector_id
+            ),
             tag_id,
             ts,
             value_num,

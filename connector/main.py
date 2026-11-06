@@ -15,6 +15,7 @@ import asyncio
 import os
 import signal
 import time
+from datetime import datetime, timezone
 
 from .config import Config
 from .db import pool as db_pool
@@ -23,6 +24,7 @@ from .db.spill import SpillBuffer
 from .db.writer import BatchWriter
 from .opc import client as opc_client
 from .opc.browser import discover_and_partition
+from .opc.history import load_watermarks, recover_gaps
 from .opc.subscription import subscribe
 from .utils import metrics
 from .utils.logger import configure_logging, get_logger
@@ -40,21 +42,24 @@ async def _run_opc_session(
 ) -> None:
     """Una sesión OPC-UA completa: conectar, suscribir y mantener viva hasta fallo."""
     pool = await db_pool.create_pool(cfg.db)
-    health.db_connected = True
-    metrics.DB_STATUS.set(1)
 
     # El ciclo de vida de los writers se protege desde que se crean: si la
     # conexión OPC falla tras agotar reintentos, el finally interior los para.
     writers: list[BatchWriter] = []
     writer_tasks: list[asyncio.Task] = []
+    history_task: asyncio.Task | None = None
     client = None
     try:
         await initialize_schema(pool, cfg.db)
+        # BD lista (pool + schema). A partir de aquí los writers mantienen este
+        # estado al día: un fallo de escritura lo vuelve a poner en False.
+        health.db_connected = True
+        metrics.DB_STATUS.set(1)
 
         # P0: N writers COPY en paralelo (default 2). Solo worker 0 reinyecta spill.
         num_writers = max(1, min(8, int(getattr(cfg.db, "num_writers", 2))))
         writers = [
-            BatchWriter(pool, cfg.db, queue, spill, worker_id=i)
+            BatchWriter(pool, cfg.db, queue, spill, worker_id=i, health=health)
             for i in range(num_writers)
         ]
         writer_tasks = [asyncio.create_task(w.run(), name=f"batch-writer-{i}")
@@ -68,13 +73,51 @@ async def _run_opc_session(
                 description="opc_connect",
                 on_retry=metrics.OPC_RECONNECTIONS.inc,
             )
+            tags = await discover_and_partition(client, pool, cfg.opc, cfg.db)
+
+            # Huecos por reconexión (Fase 6): watermark por tag desde PostgreSQL.
+            # Si falla la consulta, la ingesta en tiempo real no debe caerse.
+            watermarks: dict[int, datetime] = {}
+            if cfg.history_recovery_enabled:
+                try:
+                    watermarks = await load_watermarks(pool, cfg.db.data_table)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("history_watermark_failed", error=str(exc))
+
+            # Corte antes de crear la suscripción: el histórico cubre hasta aquí;
+            # lo posterior llega por DataChange. El solape se deduplica por event_id.
+            cutoff = datetime.now(timezone.utc)
+            await subscribe(client, tags, queue, cfg.opc, cfg.connector_id, spill)
+
+            # Solo ahora hay una suscripción activa: hasta este punto el conector
+            # no está ingiriendo, aunque la sesión OPC ya esté establecida.
             health.opc_connected = True
             metrics.SESSION_STATUS.set(1)
 
-            tags = await discover_and_partition(client, pool, cfg.opc, cfg.db)
-            await subscribe(client, tags, queue, cfg.opc, cfg.connector_id, spill)
+            if cfg.history_recovery_enabled and watermarks:
+                history_task = asyncio.create_task(
+                    recover_gaps(
+                        tags=tags,
+                        watermarks=watermarks,
+                        cutoff=cutoff,
+                        connector_id=cfg.connector_id,
+                        queue=queue,
+                        spill=spill,
+                        max_gap_s=cfg.history_recovery_max_gap_s,
+                        batch_size=cfg.history_recovery_batch,
+                        timeout_s=cfg.history_recovery_timeout_s,
+                    ),
+                    name="history-recovery",
+                )
+
             await _wait_until_disconnected(client, stop_event)
         finally:
+            # Cancelar la recuperación antes de cerrar el cliente para que no
+            # queden lecturas en vuelo sobre una sesión que se está cerrando.
+            if history_task is not None:
+                if not history_task.done():
+                    history_task.cancel()
+                await asyncio.gather(history_task, return_exceptions=True)
             health.opc_connected = False
             metrics.SESSION_STATUS.set(0)
             if client is not None:

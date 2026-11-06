@@ -143,6 +143,7 @@ class OpcConfig:
     node_id_filter: Optional[str]
     tag_offset: int
     tag_limit: int
+    allow_tag_omission: bool
     session_timeout_ms: int
     queue_max_size: int
 
@@ -183,6 +184,10 @@ class Config:
     reconnect_max_retries: int
     reconnect_base_delay_s: float
     shutdown_timeout_s: float
+    history_recovery_enabled: bool
+    history_recovery_max_gap_s: float
+    history_recovery_batch: int
+    history_recovery_timeout_s: float
     opc: OpcConfig
     db: DbConfig
 
@@ -249,6 +254,10 @@ class Config:
             node_id_filter=_opt("OPC_NODE_ID_FILTER"),
             tag_offset=_int("OPC_TAG_OFFSET", 0, min_value=0),
             tag_limit=_int("OPC_TAG_LIMIT", 5000, min_value=1, max_value=100000),
+            # Solo un opt-in explícito permite recortar el catálogo. No se
+            # infiere de OPC_TAG_OFFSET/OPC_TAG_LIMIT: el compose base las
+            # define y anularía la protección.
+            allow_tag_omission=_bool("OPC_ALLOW_TAG_OMISSION", False),
             session_timeout_ms=_int("OPC_SESSION_TIMEOUT_MS", 30000, min_value=5000),
             queue_max_size=_int("OPC_QUEUE_MAX_SIZE", 500000, min_value=1000),
         )
@@ -313,6 +322,16 @@ class Config:
             # Tiempo máximo de drenado/parada ordenada antes de forzar la salida.
             shutdown_timeout_s=_float("SHUTDOWN_TIMEOUT_S", 30.0,
                                       min_value=5.0, max_value=300.0),
+            history_recovery_enabled=_bool("HISTORY_RECOVERY_ENABLED", True),
+            history_recovery_max_gap_s=_float(
+                "HISTORY_RECOVERY_MAX_GAP_S", 86400.0, min_value=0.0
+            ),
+            history_recovery_batch=_int(
+                "HISTORY_RECOVERY_BATCH", 1000, min_value=1, max_value=10000
+            ),
+            history_recovery_timeout_s=_float(
+                "HISTORY_RECOVERY_TIMEOUT_S", 30.0, min_value=1.0, max_value=300.0
+            ),
             opc=opc,
             db=db,
         )

@@ -12,6 +12,11 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Gauge, Histogram, ge
 
 # ── Definición de métricas (§13.1) ───────────────────────────────────────────
 TAGS_TOTAL = Gauge("opc_connector_tags_total", "Total de tags suscritos")
+BROWSE_ERRORS = Counter(
+    "opc_connector_browse_errors_total",
+    "Errores de descubrimiento que pueden dejar el catálogo incompleto",
+    ["kind"],
+)
 VALUES_RECEIVED = Counter("opc_connector_values_received_total", "Valores recibidos del servidor OPC-UA")
 VALUES_WRITTEN = Counter("opc_connector_values_written_total", "Valores escritos en TimescaleDB")
 VALUES_DROPPED = Counter("opc_connector_values_dropped_total", "Valores descartados por buffer lleno")
@@ -82,6 +87,29 @@ SHUTDOWN_SECONDS = Histogram(
 SHUTDOWN_DROPPED = Counter(
     "opc_connector_shutdown_dropped_total",
     "Registros no drenados ni persistidos durante el apagado",
+)
+
+# Recuperación de huecos OPC por reconexión (Fase 6)
+HISTORY_GAP_SECONDS = Histogram(
+    "opc_connector_history_gap_seconds",
+    "Hueco temporal detectado por reconexión (último ts persistido → corte)",
+)
+HISTORY_GAP_UNRECOVERED = Counter(
+    "opc_connector_history_gap_unrecovered_total",
+    "Huecos no recuperados (sin histórico, nodo no historizado o error)",
+)
+HISTORY_READ = Counter(
+    "opc_connector_history_read_total",
+    "Resultado de las operaciones de HistoryRead",
+    ["result"],
+)
+HISTORY_READ_VALUES = Counter(
+    "opc_connector_history_read_values_total",
+    "Valores históricos recuperados e inyectados",
+)
+HISTORY_READ_DURATION = Histogram(
+    "opc_connector_history_read_duration_seconds",
+    "Duración de la recuperación histórica por tag",
 )
 
 

@@ -146,7 +146,7 @@ async def _create_data_table(
             f"""
             SELECT create_hypertable(
                 '{data}', 'ts',
-                chunk_time_interval => INTERVAL '15 minutes',
+                chunk_time_interval => INTERVAL '1 day',
                 if_not_exists => TRUE
             );
             """
@@ -182,17 +182,20 @@ async def _create_data_table(
         # PostgreSQL plano: sin compresión nativa. Considerar particionado declarativo manual.
         return
 
-    # Política de compresión (datos > 7 días). Tolerante si ya existe.
+    # Política de compresión (datos > 1 mes) y retención (365 días). Tolerante si ya existe.
     try:
         await conn.execute(
             f"ALTER TABLE {data} SET (timescaledb.compress, "
             f"timescaledb.compress_segmentby = 'tag_id');"
         )
         await conn.execute(
-            f"SELECT add_compression_policy('{data}', INTERVAL '7 days', if_not_exists => TRUE);"
+            f"SELECT add_compression_policy('{data}', INTERVAL '1 month', if_not_exists => TRUE);"
+        )
+        await conn.execute(
+            f"SELECT add_retention_policy('{data}', INTERVAL '365 days', if_not_exists => TRUE);"
         )
     except asyncpg.PostgresError as exc:  # noqa: BLE001
-        log.warning("compression_policy_skip", error=str(exc))
+        log.warning("compression_or_retention_policy_skip", error=str(exc))
 
 
 async def _verify_permissions(conn: asyncpg.Connection, catalog: str, data: str) -> None:

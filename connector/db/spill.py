@@ -42,6 +42,7 @@ from typing import Any, List, Optional, Tuple
 
 from ..config import DbConfig
 from ..utils import metrics
+from ..utils.event_id import deterministic_event_id
 from ..utils.logger import get_logger
 
 log = get_logger(__name__)
@@ -53,7 +54,7 @@ _SEG_SUFFIX = ".jsonl"
 Record = Tuple[uuid.UUID, int, datetime, Optional[float], Optional[str], int, str]
 
 # Namespace estable para derivar event_id de líneas de spill antiguas (6 campos).
-_LEGACY_NS = uuid.UUID("6f0c9d5e-3b8a-4c1d-9f2e-7a1b2c3d4e5f")
+# (la implementación vive en connector.utils.event_id)
 _ACK_SUFFIX = ".ack"
 
 # ── Serialización rápida (orjson con fallback) ─────────────────────────────
@@ -94,11 +95,9 @@ def _legacy_event_id(
     Así un mismo registro legacy replayado dos veces genera el mismo id y la
     clave única de PostgreSQL lo deduplica.
     """
-    key = "|".join([
-        str(tag_id), ts.isoformat(), repr(value_num), repr(value_str),
-        str(quality), str(connector_id),
-    ])
-    return uuid.uuid5(_LEGACY_NS, key)
+    return deterministic_event_id(
+        tag_id, ts, value_num, value_str, quality, connector_id
+    )
 
 
 def _encode(r: Record) -> list:
