@@ -19,6 +19,11 @@ END
 $$;
 
 GRANT CONNECT ON DATABASE scada_db TO connector_user;
+-- La deduplicación (POSTGRES_DEDUP_ENABLED=true) crea una tabla TEMP por lote:
+-- sin el privilegio TEMP la ingesta falla con "permission denied to create
+-- temporary tables in database". PUBLIC lo tiene por defecto; se hace explícito
+-- para que sobreviva a un endurecimiento del rol o a un REVOKE sobre PUBLIC.
+GRANT TEMP ON DATABASE scada_db TO connector_user;
 -- PostgreSQL 15+ ya no concede CREATE sobre el schema public a PUBLIC.
 -- El conector crea sus tablas de forma idempotente en la primera conexión,
 -- por lo que necesita CREATE además de USAGE.

@@ -18,7 +18,7 @@ scrape_configs:
     static_configs:
       - targets:
           - "host.docker.internal:8001"   # connector-01
-          # - "host.docker.internal:8002" # connector-02 (docker-compose.scale.yml)
+          - "host.docker.internal:8002"   # connector-02 (docker-compose.scale.yml)
           # - "host.docker.internal:8003" # connector-03
         labels:
           environment: production

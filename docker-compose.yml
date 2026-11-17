@@ -26,6 +26,13 @@ services:
     # Debe ser mayor que SHUTDOWN_TIMEOUT_S (default 30s) para permitir el
     # drenado ordenado antes de que Docker envíe SIGKILL.
     stop_grace_period: 45s
+    # Rotación de logs: json-file sin límite crece sin control (~50-80 MB/día por
+    # conector a INFO) y puede llenar el disco del host. 20m x 5 = 100 MB por contenedor.
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
     env_file:
       - .env                      # POSTGRES_HOST, OPC_SERVER_URL y resto de config no sensible
     environment:
@@ -59,11 +66,14 @@ services:
     # ── Límites de recursos ───────────────────────────────────────────────────
     # Ajustar según el throughput real medido y el número de conectores en el host.
     # Regla general: 1 core + 512 MB RAM por conector para cargas de ~10k val/s.
+    # Memoria: 1G (no 512M) porque durante una caída de BD la cola en memoria se
+    # llena (OPC_QUEUE_MAX_SIZE=500000 ≈ 150-200 MB de records) y un OOM-kill
+    # perdería exactamente esos registros. Con 16 GB de host, el margen es gratis.
     deploy:
       resources:
         limits:
           cpus: "1.0"
-          memory: 512M
+          memory: 1G
         reservations:
           cpus: "0.25"
           memory: 128M

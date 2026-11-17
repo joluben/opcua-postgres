@@ -139,12 +139,19 @@ def _make_health_handler(state: HealthState):
 
 
 async def start_http_server(port: int, state: HealthState) -> web.AppRunner:
-    """Arranca el servidor HTTP de observabilidad y devuelve el runner para cerrarlo."""
+    """Arranca el servidor HTTP de observabilidad y devuelve el runner para cerrarlo.
+
+    ``access_log=None``: sin esto aiohttp escribe una línea ``aiohttp.access`` por
+    CADA petición, es decir una por cada HEALTHCHECK de Docker (30 s) y otra por
+    cada scrape de Prometheus (15 s). Si el entorno no tiene Prometheus son logs
+    que no van a ningún lado (~2.900 líneas/día por conector). Los errores del
+    servidor sí se siguen registrando.
+    """
     app = web.Application()
     app.router.add_get("/metrics", _metrics_handler)
     app.router.add_get("/health", _make_health_handler(state))
 
-    runner = web.AppRunner(app)
+    runner = web.AppRunner(app, access_log=None)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()

@@ -42,6 +42,32 @@ def test_security_none_does_not_require_certs(monkeypatch):
     assert cfg.db.host == "db.internal.example"
 
 
+def test_metrics_enabled_defaults_to_true(monkeypatch):
+    """Sin METRICS_ENABLED el endpoint de observabilidad queda activo."""
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.delenv("METRICS_ENABLED", raising=False)
+
+    assert Config.from_env().metrics_enabled is True
+
+
+@pytest.mark.parametrize("raw", ["false", "0", "no", "off", "FALSE"])
+def test_metrics_can_be_disabled(monkeypatch, raw):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv("METRICS_ENABLED", raw)
+
+    assert Config.from_env().metrics_enabled is False
+
+
+def test_metrics_enabled_explicit_true(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv("METRICS_ENABLED", "true")
+
+    assert Config.from_env().metrics_enabled is True
+
+
 def test_read_secret_file_takes_precedence(monkeypatch, tmp_path):
     secret_file = tmp_path / "pw.txt"
     secret_file.write_text("from-file\n")

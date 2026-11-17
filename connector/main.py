@@ -182,7 +182,18 @@ async def main() -> None:
     log.info("connector_start", version=version, db_host=cfg.db.host, opc_url=cfg.opc.server_url)
 
     health = metrics.HealthState()
-    runner = await metrics.start_http_server(cfg.metrics_port, health)
+    # METRICS_ENABLED=false (entornos sin Prometheus): no se abre el puerto de
+    # observabilidad. /metrics y /health dejan de existir; el HEALTHCHECK del
+    # Dockerfile lo detecta y pasa a reportar 'healthy' sin sondear nada.
+    runner = None
+    if cfg.metrics_enabled:
+        runner = await metrics.start_http_server(cfg.metrics_port, health)
+        log.info("metrics_server_started", port=cfg.metrics_port)
+    else:
+        log.warning(
+            "metrics_server_disabled",
+            detail="METRICS_ENABLED=false: /metrics y /health deshabilitados",
+        )
 
     # Capacidad expuesta para que las alertas calculen ocupación relativa.
     try:
@@ -253,7 +264,8 @@ async def main() -> None:
         if shutdown_started is None:
             shutdown_started = time.monotonic()
         spill.close()
-        await runner.cleanup()
+        if runner is not None:
+            await runner.cleanup()
         try:
             metrics.SHUTDOWN_SECONDS.observe(time.monotonic() - shutdown_started)
         except Exception:  # noqa: BLE001

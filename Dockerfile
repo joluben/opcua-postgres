@@ -64,9 +64,12 @@ USER connector
 # Puerto de métricas Prometheus y endpoint /health
 EXPOSE 8000
 
-# Health check contra el endpoint HTTP del propio conector
+# Health check contra el endpoint HTTP del propio conector.
 # P0: timeout explícito en el probe para no colgar el healthcheck.
+# Con METRICS_ENABLED=false no hay endpoint que sondear: el probe sale 0 para no
+# dejar el contenedor en 'unhealthy' permanente (la señal de vida pasa a ser el
+# propio proceso). Ver README, sección "Despliegue SIN Prometheus".
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD python -c "import urllib.request,os; urllib.request.urlopen('http://localhost:%s/health' % os.getenv('METRICS_PORT','8000'), timeout=5)"
+    CMD python -c "import os,sys,urllib.request;e=os.getenv('METRICS_ENABLED','true').strip().lower() in ('1','true','yes','on');sys.exit(0) if not e else urllib.request.urlopen('http://localhost:%s/health' % os.getenv('METRICS_PORT','8000'), timeout=5)"
 
 CMD ["python", "-m", "connector.main"]

@@ -180,6 +180,55 @@ GRAFANA_ADMIN_PASSWORD='cambiar-esto' \
 Las alertas cubren conectividad, cola, spill, lag, latencia, pérdidas,
 deduplicación y reconexiones. Ver [`monitoring/README.md`](monitoring/README.md).
 
+### Despliegue SIN Prometheus
+
+La monitorización es **opcional y separada**: `docker-compose.monitoring.yml` es un
+stack independiente. Si no se levanta, no hay nada que desactivar en el conector y
+**no se genera ningún log** hacia Prometheus (el servidor HTTP no registra accesos).
+
+Qué sigue activo y cuánto cuesta:
+
+| Componente | Coste sin Prometheus | ¿Se puede quitar? |
+|---|---|---|
+| `GET /metrics` + `/health` (puerto 8000) | ~2 MB RAM, 0 CPU en reposo | Sí: `METRICS_ENABLED=false` (el `HEALTHCHECK` se adapta solo) |
+| Contadores `opc_connector_*` en memoria | despreciable (<1 % CPU) | No (van dentro del proceso) |
+| Log `batch_written` por lote (INFO) | ~1 línea por lote | Sí: `LOG_LEVEL=WARNING` |
+
+Si el entorno no tiene Prometheus:
+
+1. **No ejecutes** `docker-compose.monitoring.yml`.
+2. **No publiques** el puerto en el compose (sigue accesible para el `HEALTHCHECK`
+   dentro del contenedor; desde el host deja de estarlo):
+
+   ```yaml
+   # docker-compose.yml -> service connector-01
+   # ports:
+   #   - "8001:8000"
+   expose:
+     - "8000"          # visible solo en la red Docker
+   ```
+
+3. Para un régimen silencioso en producción (día 1 con `INFO` para diagnosticar):
+   `LOG_LEVEL=WARNING`. Se mantienen `connector_start`, reconexiones, fallos de BD,
+   spill y apagado; solo desaparece el detalle por lote.
+
+4. **Desactivar el endpoint por completo** (`/metrics` y `/health`):
+
+   ```bash
+   METRICS_ENABLED=false
+   ```
+
+   No se abre el puerto 8000 y el `HEALTHCHECK` de la imagen detecta el flag y
+   sale `0` sin sondear nada (el contenedor nunca queda `unhealthy`). Pierdes el
+   estado `healthy/unhealthy` en `docker ps`, que pasa a depender solo de que el
+   proceso esté vivo. Se registra `metrics_server_disabled` al arrancar.
+
+   ⚠️ Con el endpoint desactivado no hay forma de consultar cola/spill/backlog
+   sin volver a activarlo; el spill y la deduplicación siguen funcionando igual.
+
+El contenedor seguirá marcándose `healthy`/`unhealthy` con `docker ps` como señal
+de vida mínima (`/health` = 200 solo si OPC y BD están conectados).
+
 ## Tests
 
 ```bash
@@ -233,6 +282,8 @@ crash no duplica filas. En CI se ejecuta en el job `integration`.
 | Arranque falla: *extensión TimescaleDB no instalada* | DBA no ejecutó `dba_setup.sql` | Ejecutar el script en la BD remota |
 | Arranque falla: *permiso insuficiente* | Falta `INSERT`/`UPDATE` | Revisar `GRANT` (§8.2 del plan / `dba_setup.sql`) |
 | Arranque falla: *permission denied for schema public* | Falta `CREATE` en el schema (PostgreSQL 15+) | Ejecutar `GRANT USAGE, CREATE ON SCHEMA public TO connector_user;` |
+| Arranque falla: *operation not supported on hypertables that have compression enabled* | La hypertable ya está comprimida y **no** tiene el índice único de dedup (BD creada con `POSTGRES_DEDUP_ENABLED=false` o anterior a la Fase 2) | Descomprimir los chunks, crear `uq_<tabla>_event_ts` y reactivar la compresión; o arrancar con `POSTGRES_DEDUP_ENABLED=false` |
+| Arranque repetido: *schema_init_deadlock_retry* | El DDL coincide con el job de compresión de TimescaleDB (habitual con 2 conectores arrancando a la vez) | Transitorio: se reintenta solo (3 intentos). Si persiste, arrancar los conectores en serie |
 | Tags duplicados/huecos entre conectores | Particionamiento no coordinado | Asegurar partición por catálogo (`node_id`), no por browse ad-hoc |
 | Latencia de escritura alta | Chunks grandes / BD subdimensionada | Revisar tuning (§15.2), chunk de 15 min, recursos del host de BD |
 

@@ -12,6 +12,7 @@ Los nombres de tabla provienen de configuración; se validan para evitar inyecci
 
 from __future__ import annotations
 
+import asyncio
 import re
 
 import asyncpg
@@ -34,10 +35,38 @@ def _validate_ident(name: str) -> str:
     return name
 
 
+# Reintentos ante deadlock en el DDL inicial. TimescaleDB puede detectar un
+# deadlock cuando el DDL (ALTER TABLE / CREATE INDEX) coincide con su job de
+# compresión en la misma hypertable: el job retiene el lock de tabla y el DDL
+# pide el lock de relación (o al revés). Es transitorio por definición y en
+# producción ocurre al arrancar dos conectores a la vez sobre la misma BD.
+_INIT_MAX_ATTEMPTS = 3
+_INIT_RETRY_BASE_S = 0.5
+
+
 async def initialize_schema(pool: asyncpg.Pool, cfg: DbConfig) -> None:
     catalog = _validate_ident(cfg.catalog_table)
     data = _validate_ident(cfg.data_table)
 
+    for attempt in range(1, _INIT_MAX_ATTEMPTS + 1):
+        try:
+            await _initialize_once(pool, cfg, catalog, data)
+            return
+        except asyncpg.DeadlockDetectedError as exc:
+            if attempt >= _INIT_MAX_ATTEMPTS:
+                raise
+            log.warning(
+                "schema_init_deadlock_retry",
+                attempt=attempt,
+                table=data,
+                error=str(exc),
+            )
+            await asyncio.sleep(_INIT_RETRY_BASE_S * attempt)
+
+
+async def _initialize_once(
+    pool: asyncpg.Pool, cfg: DbConfig, catalog: str, data: str
+) -> None:
     async with pool.acquire() as conn:
         if cfg.use_timescale:
             await _ensure_timescaledb(conn)
@@ -162,21 +191,38 @@ async def _create_data_table(
     # Clave de deduplicación: el replay desde disco es at-least-once y la
     # inserción usa ON CONFLICT (event_id, ts) DO NOTHING. El predicado deja
     # fuera las filas legadas (event_id NULL) sin penalizar el índice.
+    #
+    # P0: TimescaleDB rechaza CREATE [UNIQUE] INDEX —incluso con IF NOT EXISTS—
+    # sobre una hypertable con compresión activada: su hook aborta antes de
+    # comprobar si el índice ya existe ("operation not supported on hypertables
+    # that have compression enabled"). Como la compresión se activa al final de
+    # esta misma función, a partir del segundo arranque el índice ya está creado
+    # y emitir el CREATE hacía fallar initialize_schema en bucle: el contenedor
+    # reiniciaba sin llegar a ingerir. Por eso se consulta el catálogo primero.
     if not dedup_enabled:
         log.info("dedup_disabled_skip_index", table=data)
     else:
-        try:
-            await conn.execute(
-                f"CREATE UNIQUE INDEX IF NOT EXISTS uq_{data}_event_ts "
-                f"ON {data} (event_id, ts) WHERE event_id IS NOT NULL;"
-            )
-        except asyncpg.PostgresError as exc:
-            raise InitializationError(
-                "No se pudo crear la clave única de deduplicación "
-                f"(event_id, ts) en '{data}': {exc}. "
-                "POSTGRES_DEDUP_ENABLED=true requiere este índice. "
-                "Revise permisos/estado de la hypertable o desactive la deduplicación."
-            ) from exc
+        index_name = f"uq_{data}_event_ts"
+        index_exists = await conn.fetchval(
+            "SELECT to_regclass($1) IS NOT NULL", index_name
+        )
+        if index_exists:
+            log.info("dedup_index_present", table=data, index=index_name)
+        else:
+            try:
+                await conn.execute(
+                    f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} "
+                    f"ON {data} (event_id, ts) WHERE event_id IS NOT NULL;"
+                )
+            except asyncpg.PostgresError as exc:
+                raise InitializationError(
+                    "No se pudo crear la clave única de deduplicación "
+                    f"(event_id, ts) en '{data}': {exc}. "
+                    "POSTGRES_DEDUP_ENABLED=true requiere este índice. "
+                    "Si la hypertable ya tiene compresión activa, el DBA debe "
+                    "descomprimir sus chunks y crear el índice antes de volver "
+                    "a habilitarla (o desactivar la deduplicación)."
+                ) from exc
 
     if not use_timescale:
         # PostgreSQL plano: sin compresión nativa. Considerar particionado declarativo manual.

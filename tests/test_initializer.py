@@ -1,6 +1,7 @@
 """Tests de la verificación de permisos de aprovisionamiento (PG15+)."""
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -10,6 +11,7 @@ from connector.db.initializer import (
     InitializationError,
     _create_data_table,
     _ensure_create_privilege,
+    initialize_schema,
 )
 
 
@@ -52,9 +54,15 @@ async def test_existing_table_does_not_require_create():
 
 
 class _SchemaConn:
-    def __init__(self, *, fail_unique: bool = False) -> None:
+    def __init__(self, *, fail_unique: bool = False, index_exists: bool = False) -> None:
         self.queries = []
         self.fail_unique = fail_unique
+        self.index_exists = index_exists
+
+    async def fetchval(self, query, *args):
+        if "to_regclass" in query:
+            return self.index_exists
+        raise AssertionError(f"consulta inesperada: {query}")
 
     async def execute(self, query, *args):
         self.queries.append(query)
@@ -75,6 +83,25 @@ async def test_data_table_gets_event_id_and_unique_index():
     assert "ADD COLUMN IF NOT EXISTS event_id UUID" in ddl
     assert "CREATE UNIQUE INDEX IF NOT EXISTS uq_opc_raw_values_event_ts" in ddl
     assert "WHERE event_id IS NOT NULL" in ddl
+
+
+@pytest.mark.asyncio
+async def test_unique_index_is_not_recreated_when_it_already_exists():
+    """Regresión P0: crash-loop al reiniciar contra una BD ya inicializada.
+
+    TimescaleDB rechaza `CREATE UNIQUE INDEX` sobre una hypertable comprimida
+    **aunque el índice ya exista y se use IF NOT EXISTS**; en el segundo arranque
+    el índice está creado y la compresión activa, así que el DDL no debe emitirse.
+    """
+    conn = _SchemaConn(index_exists=True)
+    await _create_data_table(
+        conn, "opc_raw_values", "opc_tags_catalog", use_timescale=False,
+        dedup_enabled=True,
+    )
+
+    assert not any("CREATE UNIQUE INDEX" in q for q in conn.queries), (
+        "se reemitió el CREATE UNIQUE INDEX con el índice ya existente"
+    )
 
 
 @pytest.mark.asyncio
@@ -102,3 +129,69 @@ def test_dba_setup_grants_create_on_schema():
         encoding="utf-8"
     )
     assert "GRANT USAGE, CREATE ON SCHEMA public TO connector_user;" in sql
+    assert "GRANT TEMP ON DATABASE scada_db TO connector_user;" in sql
+
+
+class _AcquireCtx:
+    def __init__(self, conn) -> None:
+        self._conn = conn
+
+    async def __aenter__(self):
+        return self._conn
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class _DeadlockOnceConn:
+    """Primera sentencia DDL -> deadlock; el resto, correcto."""
+
+    def __init__(self) -> None:
+        self.executed = 0
+        self.failed = False
+
+    async def fetchval(self, query, *args):
+        if "pg_extension" in query:
+            return 1
+        if "to_regclass" in query:
+            return True
+        if "has_table_privilege" in query:
+            return True
+        raise AssertionError(f"consulta inesperada: {query}")
+
+    async def execute(self, query, *args):
+        self.executed += 1
+        if not self.failed:
+            self.failed = True
+            raise asyncpg.DeadlockDetectedError("deadlock detected")
+        return "OK"
+
+
+class _DeadlockPool:
+    def __init__(self, conn) -> None:
+        self.conn = conn
+        self.acquires = 0
+
+    def acquire(self):
+        self.acquires += 1
+        return _AcquireCtx(self.conn)
+
+
+@pytest.mark.asyncio
+async def test_initialize_schema_retries_on_deadlock():
+    """DDL + job de compresión de TimescaleDB pueden chocar (deadlock transitorio).
+
+    Sin reintento, el arranque de dos conectores a la vez dependía del ciclo de
+    reintento de sesión completo (~30 s con backoff).
+    """
+    conn = _DeadlockOnceConn()
+    pool = _DeadlockPool(conn)
+    cfg = SimpleNamespace(
+        use_timescale=True, catalog_table="opc_tags_catalog",
+        data_table="opc_raw_values", dedup_enabled=False,
+    )
+
+    await initialize_schema(pool, cfg)  # no debe propagar el deadlock
+
+    assert pool.acquires == 2, "no se reintentó tras el deadlock"
+    assert conn.executed > 1

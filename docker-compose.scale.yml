@@ -9,6 +9,11 @@ version: "3.9"
 # Los secrets (postgres_password, opc_password) y los límites de recursos se heredan
 # de docker-compose.yml. Los ficheros de secrets deben existir antes de levantar.
 #
+# IMPORTANTE: `extends` FUSIONA las secuencias (ports se APPENDEA, no se sustituye).
+# Sin `!override`, connector-02 heredaría el "8001:8000" del servicio base e
+# intentaría publicar el mismo puerto que connector-01 -> fallo de arranque en
+# `docker compose up` ("port is already allocated"). Requiere Compose >= 2.24.4.
+#
 # NOTA de particionamiento: el reparto OPC_TAG_OFFSET/OPC_TAG_LIMIT debe basarse en un
 # orden estable del catálogo (ORDER BY node_id) para evitar solapes/huecos. Ajustar el
 # número de conectores y OPC_TAG_LIMIT al throughput real validado de asyncua (ver §9.3/§14).
@@ -26,7 +31,7 @@ services:
       # El escalado particiona el catálogo a propósito: el recorte por partición
       # se registra como warning en vez de abortar.
       OPC_ALLOW_TAG_OMISSION: "true"
-    ports:
+    ports: !override
       - "8001:8000"
 
   connector-02:
@@ -41,7 +46,7 @@ services:
       # El escalado particiona el catálogo a propósito: el recorte por partición
       # se registra como warning en vez de abortar.
       OPC_ALLOW_TAG_OMISSION: "true"
-    ports:
+    ports: !override
       - "8002:8000"
 
   connector-03:
@@ -56,7 +61,7 @@ services:
       # El escalado particiona el catálogo a propósito: el recorte por partición
       # se registra como warning en vez de abortar.
       OPC_ALLOW_TAG_OMISSION: "true"
-    ports:
+    ports: !override
       - "8003:8000"
 
   connector-04:
@@ -71,5 +76,5 @@ services:
       # El escalado particiona el catálogo a propósito: el recorte por partición
       # se registra como warning en vez de abortar.
       OPC_ALLOW_TAG_OMISSION: "true"
-    ports:
+    ports: !override
       - "8004:8000"

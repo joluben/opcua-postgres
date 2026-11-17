@@ -120,6 +120,43 @@ async def test_connector_role_is_restricted_and_can_initialize_schema():
 
 
 @pytest.mark.asyncio
+async def test_initialize_schema_is_idempotent_with_compression_enabled():
+    """Segundo arranque del conector sobre una hypertable ya comprimida.
+
+    Regresión P0: TimescaleDB rechaza `CREATE UNIQUE INDEX` sobre hypertables con
+    compresión activa incluso con `IF NOT EXISTS`, lo que hacía que cada reinicio
+    del conector fallase en `initialize_schema` y entrase en crash-loop.
+    """
+    catalog, data = _names()
+    pool = await asyncpg.create_pool(_DSN, min_size=1, max_size=2)
+    cfg = _cfg(catalog, data)
+    try:
+        await initialize_schema(pool, cfg)
+        async with pool.acquire() as c:
+            compressed = await c.fetchval(
+                "SELECT compression_enabled FROM timescaledb_information.hypertables "
+                "WHERE hypertable_name = $1",
+                data,
+            )
+        assert compressed is True, "la hypertable no quedó comprimida: el test no reproduce el caso"
+
+        # Lo que hace el conector en CADA arranque.
+        await initialize_schema(pool, cfg)
+
+        async with pool.acquire() as c:
+            index = await c.fetchval(
+                "SELECT indexname FROM pg_indexes "
+                "WHERE tablename = $1 AND indexname LIKE 'uq_%_event_ts'",
+                data,
+            )
+        assert index, "el índice único de deduplicación desapareció"
+    finally:
+        async with pool.acquire() as c:
+            await _drop(c, data, catalog)
+        await pool.close()
+
+
+@pytest.mark.asyncio
 async def test_duplicate_batch_is_idempotent():
     catalog, data, pool = await _prepare_schema()
     try:

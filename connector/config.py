@@ -181,6 +181,7 @@ class Config:
     log_level: str
     log_format: str
     metrics_port: int
+    metrics_enabled: bool
     reconnect_max_retries: int
     reconnect_base_delay_s: float
     shutdown_timeout_s: float
@@ -317,6 +318,10 @@ class Config:
             log_level=os.getenv("LOG_LEVEL", "INFO"),
             log_format=os.getenv("LOG_FORMAT", "json"),
             metrics_port=_int("METRICS_PORT", 8000),
+            # false: no se arranca el servidor HTTP de observabilidad (/metrics y
+            # /health). Pensado para entornos sin Prometheus, donde el endpoint no
+            # tiene consumidor. El HEALTHCHECK de la imagen se adapta solo.
+            metrics_enabled=_bool("METRICS_ENABLED", True),
             reconnect_max_retries=_int("RECONNECT_MAX_RETRIES", 10),
             reconnect_base_delay_s=_float("RECONNECT_BASE_DELAY_S", 2.0),
             # Tiempo máximo de drenado/parada ordenada antes de forzar la salida.
