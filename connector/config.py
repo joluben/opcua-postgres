@@ -12,6 +12,7 @@ Reglas (P0 fail-closed):
 from __future__ import annotations
 
 import os
+import re
 import warnings
 from dataclasses import dataclass
 from pathlib import Path
@@ -127,6 +128,33 @@ def _bool(name: str, default: bool) -> bool:
     return raw.strip().lower() in ("1", "true", "yes", "on")
 
 
+# Intervalos admitidos para las políticas de TimescaleDB. Se restringen a
+# "<n> <unidad>" para poder interpolarlos en SQL sin riesgo de inyección.
+_INTERVAL_RE = re.compile(r"^\d+\s+(hour|day|week|month|year)s?$", re.IGNORECASE)
+_INTERVAL_DISABLED = {"", "0", "off", "none", "false", "disabled"}
+
+
+def _interval(name: str, default: Optional[str]) -> Optional[str]:
+    """Lee un intervalo tipo ``'30 days'``. Devuelve ``None`` si está desactivado.
+
+    ``None`` significa "no gestionar esta política desde el conector": el DBA la
+    configura (o la deja sin configurar) directamente en la base de datos.
+    """
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    value = raw.strip()
+    if value.lower() in _INTERVAL_DISABLED:
+        return None
+    if not _INTERVAL_RE.match(value):
+        raise ConfigError(
+            f"{name} debe ser un intervalo tipo '30 days', '1 month' o "
+            f"'365 days' (o 'disabled' para que lo gestione el DBA), "
+            f"recibido: {raw!r}"
+        )
+    return value
+
+
 @dataclass(frozen=True)
 class OpcConfig:
     server_url: str
@@ -166,6 +194,10 @@ class DbConfig:
     command_timeout_s: float
     num_writers: int
     use_timescale: bool
+    # None = política no gestionada por el conector (la define el DBA).
+    timescale_chunk_interval: Optional[str]
+    timescale_compression_interval: Optional[str]
+    timescale_retention_interval: Optional[str]
     spill_enabled: bool
     spill_dir: str
     spill_max_mb: int
@@ -302,6 +334,19 @@ class Config:
                                      min_value=2.0, max_value=120.0),
             num_writers=_int("POSTGRES_NUM_WRITERS", 2, min_value=1, max_value=8),
             use_timescale=_bool("POSTGRES_USE_TIMESCALE", True),
+            # Políticas de TimescaleDB. Valores por defecto equivalentes al
+            # comportamiento histórico (chunk 1 día, compresión 1 mes, retención
+            # 365 días). Poner la variable a "disabled" (o "0"/"off"/"none") para
+            # que el DBA gestione esa política directamente en la base de datos.
+            timescale_chunk_interval=_interval(
+                "POSTGRES_TIMESCALE_CHUNK_INTERVAL", "1 day"
+            ),
+            timescale_compression_interval=_interval(
+                "POSTGRES_TIMESCALE_COMPRESSION_INTERVAL", "1 month"
+            ),
+            timescale_retention_interval=_interval(
+                "POSTGRES_TIMESCALE_RETENTION_INTERVAL", "365 days"
+            ),
             spill_enabled=_bool("POSTGRES_SPILL_ENABLED", True),
             spill_dir=os.getenv("POSTGRES_SPILL_DIR", "/var/lib/connector/spill"),
             spill_max_mb=_int("POSTGRES_SPILL_MAX_MB", 1024, min_value=1),

@@ -16,7 +16,10 @@ def _base_env(monkeypatch):
     # ficheros inexistentes del entorno local.
     for var in ("OPC_PASSWORD_FILE", "POSTGRES_PASSWORD_FILE",
                 "OPC_CERTIFICATE_PATH", "OPC_PRIVATE_KEY_PATH",
-                "OPC_TAG_OFFSET", "OPC_TAG_LIMIT", "OPC_ALLOW_TAG_OMISSION"):
+                "OPC_TAG_OFFSET", "OPC_TAG_LIMIT", "OPC_ALLOW_TAG_OMISSION",
+                "POSTGRES_TIMESCALE_CHUNK_INTERVAL",
+                "POSTGRES_TIMESCALE_COMPRESSION_INTERVAL",
+                "POSTGRES_TIMESCALE_RETENTION_INTERVAL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.delenv("OPC_SECURITY_POLICY", raising=False)
     monkeypatch.delenv("OPC_DEADBAND_TYPE", raising=False)
@@ -141,3 +144,54 @@ def test_tag_omission_enabled_explicitly(monkeypatch):
     cfg = Config.from_env()
 
     assert cfg.opc.allow_tag_omission is True
+
+
+def test_timescale_policy_intervals_have_safe_defaults(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+
+    db = Config.from_env().db
+
+    assert db.timescale_chunk_interval == "1 day"
+    assert db.timescale_compression_interval == "1 month"
+    assert db.timescale_retention_interval == "365 days"
+
+
+def test_timescale_policy_intervals_are_configurable(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv("POSTGRES_TIMESCALE_CHUNK_INTERVAL", "7 days")
+    monkeypatch.setenv("POSTGRES_TIMESCALE_COMPRESSION_INTERVAL", "14 days")
+    monkeypatch.setenv("POSTGRES_TIMESCALE_RETENTION_INTERVAL", "730 days")
+
+    db = Config.from_env().db
+
+    assert db.timescale_chunk_interval == "7 days"
+    assert db.timescale_compression_interval == "14 days"
+    assert db.timescale_retention_interval == "730 days"
+
+
+@pytest.mark.parametrize("raw", ["disabled", "off", "none", "0", ""])
+def test_timescale_policies_can_be_delegated_to_dba(monkeypatch, raw):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv("POSTGRES_TIMESCALE_CHUNK_INTERVAL", raw)
+    monkeypatch.setenv("POSTGRES_TIMESCALE_COMPRESSION_INTERVAL", raw)
+    monkeypatch.setenv("POSTGRES_TIMESCALE_RETENTION_INTERVAL", raw)
+
+    db = Config.from_env().db
+
+    assert db.timescale_chunk_interval is None
+    assert db.timescale_compression_interval is None
+    assert db.timescale_retention_interval is None
+
+
+def test_invalid_timescale_interval_is_rejected(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv(
+        "POSTGRES_TIMESCALE_RETENTION_INTERVAL", "1 day'; DROP TABLE x;--"
+    )
+
+    with pytest.raises(ConfigError, match="POSTGRES_TIMESCALE_RETENTION_INTERVAL"):
+        Config.from_env()

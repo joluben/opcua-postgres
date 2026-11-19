@@ -195,3 +195,73 @@ async def test_initialize_schema_retries_on_deadlock():
 
     assert pool.acquires == 2, "no se reintentó tras el deadlock"
     assert conn.executed > 1
+
+
+@pytest.mark.asyncio
+async def test_timescale_intervals_are_applied_from_configuration():
+    conn = _SchemaConn(index_exists=True)
+    await _create_data_table(
+        conn, "opc_raw_values", "opc_tags_catalog", use_timescale=True,
+        dedup_enabled=True,
+        chunk_interval="7 days",
+        compression_interval="14 days",
+        retention_interval="730 days",
+    )
+
+    ddl = "\n".join(conn.queries)
+    assert "chunk_time_interval => INTERVAL '7 days'" in ddl
+    assert "add_compression_policy('opc_raw_values', INTERVAL '14 days'" in ddl
+    assert "add_retention_policy('opc_raw_values', INTERVAL '730 days'" in ddl
+
+
+@pytest.mark.asyncio
+async def test_disabled_policies_are_left_to_the_dba():
+    """Con las variables a 'disabled' el conector no impone ninguna política."""
+    conn = _SchemaConn(index_exists=True)
+    await _create_data_table(
+        conn, "opc_raw_values", "opc_tags_catalog", use_timescale=True,
+        dedup_enabled=True,
+        chunk_interval=None,
+        compression_interval=None,
+        retention_interval=None,
+    )
+
+    ddl = "\n".join(conn.queries)
+    assert "create_hypertable" in ddl
+    assert "chunk_time_interval" not in ddl
+    assert "timescaledb.compress" not in ddl
+    assert "add_compression_policy" not in ddl
+    assert "add_retention_policy" not in ddl
+
+
+@pytest.mark.asyncio
+async def test_retention_is_applied_even_if_compression_fails():
+    class _CompressionFailsConn(_SchemaConn):
+        async def execute(self, query, *args):
+            self.queries.append(query)
+            if "add_compression_policy" in query:
+                raise asyncpg.PostgresError("compression policy not supported")
+            return "OK"
+
+    conn = _CompressionFailsConn(index_exists=True)
+    await _create_data_table(
+        conn, "opc_raw_values", "opc_tags_catalog", use_timescale=True,
+        dedup_enabled=True,
+        compression_interval="1 month",
+        retention_interval="365 days",
+    )
+
+    ddl = "\n".join(conn.queries)
+    assert "add_compression_policy" in ddl
+    assert "add_retention_policy('opc_raw_values', INTERVAL '365 days'" in ddl
+
+
+@pytest.mark.asyncio
+async def test_invalid_interval_is_rejected_before_sql_interpolation():
+    conn = _SchemaConn(index_exists=True)
+    with pytest.raises(InitializationError, match="retention_interval"):
+        await _create_data_table(
+            conn, "opc_raw_values", "opc_tags_catalog", use_timescale=True,
+            dedup_enabled=True,
+            retention_interval="365 days'; DROP TABLE opc_raw_values;--",
+        )

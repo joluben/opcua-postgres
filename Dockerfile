@@ -32,7 +32,7 @@ LABEL org.opencontainers.image.title="opcua-connector" \
       org.opencontainers.image.description="OPC-UA → TimescaleDB ingestion connector" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.source="https://github.com/CHANGE_ME/opcua-postgres"
+      org.opencontainers.image.source="https://github.com/joluben/opcua-postgres"
 
 # Seguridad: ejecutar con usuario no-root
 RUN groupadd -r connector && useradd -r -g connector connector
@@ -50,6 +50,9 @@ RUN pip install --no-cache-dir --upgrade pip \
     && rm -rf /wheels \
     && pip check
 
+# Texto de licencia dentro de la imagen (MIT para este proyecto; las
+# dependencias conservan sus propias licencias, p.ej. asyncua LGPL-3.0).
+COPY LICENSE ./LICENSE
 COPY connector/ ./connector/
 
 # El directorio de certificados se monta como volumen externo (solo lectura)

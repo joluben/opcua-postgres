@@ -3,7 +3,8 @@
 Secuencia (§8):
   1. Verifica que la extensión ``timescaledb`` esté instalada (si no, aborta).
   2. Crea la tabla de catálogo si no existe.
-  3. Crea la tabla de datos + hypertable + índices + política de compresión si no existe.
+  3. Crea la tabla de datos + hypertable + índices y, si están configuradas,
+     las políticas de compresión y retención (con posibilidad de delegarlas al DBA).
   4. Verifica permisos mínimos del usuario conector.
 
 El usuario conector NO crea extensiones ni usuarios: eso lo hace el DBA en el servidor de BD.
@@ -23,6 +24,8 @@ from ..utils.logger import get_logger
 log = get_logger(__name__)
 
 _IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+# Se interpola en SQL: solo se acepta "<n> <unidad>".
+_INTERVAL_RE = re.compile(r"^\d+\s+(hour|day|week|month|year)s?$", re.IGNORECASE)
 
 
 class InitializationError(RuntimeError):
@@ -33,6 +36,21 @@ def _validate_ident(name: str) -> str:
     if not _IDENT_RE.match(name):
         raise InitializationError(f"Nombre de tabla inválido: {name!r}")
     return name
+
+
+def _validate_interval(name: str, value: str | None) -> str | None:
+    """Valida un intervalo de TimescaleDB antes de interpolarlo en SQL.
+
+    ``None`` es válido y significa "no gestionar la política desde el conector".
+    """
+    if value is None:
+        return None
+    if not _INTERVAL_RE.match(value):
+        raise InitializationError(
+            f"Intervalo {name} inválido: {value!r}. "
+            "Formato esperado: '<n> hour|day|week|month|year' (p.ej. '30 days')."
+        )
+    return value
 
 
 # Reintentos ante deadlock en el DDL inicial. TimescaleDB puede detectar un
@@ -82,6 +100,13 @@ async def _initialize_once(
         await _create_data_table(
             conn, data, catalog, cfg.use_timescale,
             dedup_enabled=getattr(cfg, "dedup_enabled", True),
+            chunk_interval=getattr(cfg, "timescale_chunk_interval", "1 day"),
+            compression_interval=getattr(
+                cfg, "timescale_compression_interval", "1 month"
+            ),
+            retention_interval=getattr(
+                cfg, "timescale_retention_interval", "365 days"
+            ),
         )
         await _verify_permissions(conn, catalog, data)
 
@@ -149,7 +174,21 @@ async def _create_data_table(
     use_timescale: bool,
     *,
     dedup_enabled: bool = True,
+    chunk_interval: str | None = "1 day",
+    compression_interval: str | None = "1 month",
+    retention_interval: str | None = "365 days",
 ) -> None:
+    # Validar antes de cualquier DDL: si un intervalo es inválido no debe
+    # haberse creado parte del schema.
+    if use_timescale:
+        chunk_interval = _validate_interval("chunk_interval", chunk_interval)
+        compression_interval = _validate_interval(
+            "compression_interval", compression_interval
+        )
+        retention_interval = _validate_interval(
+            "retention_interval", retention_interval
+        )
+
     await conn.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {data} (
@@ -171,15 +210,32 @@ async def _create_data_table(
     )
 
     if use_timescale:
-        await conn.execute(
-            f"""
-            SELECT create_hypertable(
-                '{data}', 'ts',
-                chunk_time_interval => INTERVAL '1 day',
-                if_not_exists => TRUE
-            );
-            """
-        )
+        if chunk_interval is None:
+            # Sin intervalo explícito: TimescaleDB aplica su default y el DBA
+            # puede ajustarlo después con set_chunk_time_interval().
+            await conn.execute(
+                f"""
+                SELECT create_hypertable(
+                    '{data}', 'ts',
+                    if_not_exists => TRUE
+                );
+                """
+            )
+            log.info(
+                "timescale_chunk_interval_external",
+                table=data,
+                detail="Intervalo de chunk no gestionado por el conector.",
+            )
+        else:
+            await conn.execute(
+                f"""
+                SELECT create_hypertable(
+                    '{data}', 'ts',
+                    chunk_time_interval => INTERVAL '{chunk_interval}',
+                    if_not_exists => TRUE
+                );
+                """
+            )
 
     await conn.execute(
         f"CREATE INDEX IF NOT EXISTS idx_{data}_tag_ts ON {data} (tag_id, ts DESC);"
@@ -228,20 +284,60 @@ async def _create_data_table(
         # PostgreSQL plano: sin compresión nativa. Considerar particionado declarativo manual.
         return
 
-    # Política de compresión (datos > 1 mes) y retención (365 días). Tolerante si ya existe.
-    try:
-        await conn.execute(
-            f"ALTER TABLE {data} SET (timescaledb.compress, "
-            f"timescaledb.compress_segmentby = 'tag_id');"
+    if compression_interval is None and retention_interval is None:
+        log.info(
+            "timescale_policies_managed_externally",
+            table=data,
+            detail=(
+                "Compresión y retención desactivadas en el conector: "
+                "las gestiona el DBA directamente en la base de datos."
+            ),
         )
-        await conn.execute(
-            f"SELECT add_compression_policy('{data}', INTERVAL '1 month', if_not_exists => TRUE);"
-        )
-        await conn.execute(
-            f"SELECT add_retention_policy('{data}', INTERVAL '365 days', if_not_exists => TRUE);"
-        )
-    except asyncpg.PostgresError as exc:  # noqa: BLE001
-        log.warning("compression_or_retention_policy_skip", error=str(exc))
+        return
+
+    # Se aplican por separado para que un fallo en compresión no impida
+    # aplicar la retención (y viceversa). Tolerante si la política ya existe.
+    if compression_interval is not None:
+        try:
+            await conn.execute(
+                f"ALTER TABLE {data} SET (timescaledb.compress, "
+                f"timescaledb.compress_segmentby = 'tag_id');"
+            )
+            await conn.execute(
+                f"SELECT add_compression_policy('{data}', "
+                f"INTERVAL '{compression_interval}', if_not_exists => TRUE);"
+            )
+            log.info(
+                "timescale_compression_policy_applied",
+                table=data,
+                interval=compression_interval,
+            )
+        except asyncpg.PostgresError as exc:  # noqa: BLE001
+            log.warning(
+                "timescale_compression_policy_skip",
+                table=data,
+                interval=compression_interval,
+                error=str(exc),
+            )
+
+    if retention_interval is not None:
+        try:
+            await conn.execute(
+                f"SELECT add_retention_policy('{data}', "
+                f"INTERVAL '{retention_interval}', if_not_exists => TRUE);"
+            )
+            log.info(
+                "timescale_retention_policy_applied",
+                table=data,
+                interval=retention_interval,
+            )
+        except asyncpg.PostgresError as exc:  # noqa: BLE001
+            log.warning(
+                "timescale_retention_policy_skip",
+                table=data,
+                interval=retention_interval,
+                error=str(exc),
+            )
 
 
 async def _verify_permissions(conn: asyncpg.Connection, catalog: str, data: str) -> None:

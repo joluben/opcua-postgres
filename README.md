@@ -332,8 +332,14 @@ versión antigua inserta `event_id=NULL`. Si se desactiva
 
 ### Mantenimiento
 - **Certificados OPC-UA:** validez recomendada ≤ 3 años. Alertar 30 días antes del vencimiento.
-- **Retención/compresión:** compresión automática > 1 mes; retención automática de 365 días (`add_retention_policy`)
-  según necesidad. Dimensionar disco del host de BD por retención (plan §15.3).
+- **Retención/compresión:** configurables con `POSTGRES_TIMESCALE_CHUNK_INTERVAL`
+  (default `1 day`), `POSTGRES_TIMESCALE_COMPRESSION_INTERVAL` (default `1 month`) y
+  `POSTGRES_TIMESCALE_RETENTION_INTERVAL` (default `365 days`). Formato `<n> hour|day|week|month|year`.
+  Poner una variable a `disabled` (o `0`/`off`/`none`) para que esa política la gestione
+  el DBA directamente en la base de datos. El intervalo de chunk solo se aplica al crear
+  la hypertable. Dimensionar disco del host de BD por retención (plan §15.3).
+  > Cambiar estas variables **no modifica** políticas ya creadas en una BD existente:
+  > el DBA debe ajustarlas con `alter_retention_policy()` / `alter_compression_policy()`.
 - **Reinicios:** `restart: unless-stopped`; tras agotar `RECONNECT_MAX_RETRIES`, el contenedor
   termina y Docker lo reinicia.
 
@@ -347,3 +353,10 @@ versión antigua inserta `event_id=NULL`. Si se desactiva
   (se rechazan las obsoletas `Basic128Rsa15`/`Basic256`).
 - Contenedor sin root; usuario de BD con permisos mínimos; spill en disco con permisos `0700`/`0600`.
 - Nunca loggear variables de entorno completas ni valores de proceso.
+
+## Licencia
+
+Este proyecto se distribuye bajo licencia **MIT** (ver [`LICENSE`](LICENSE)).
+Las dependencias mantienen sus propias licencias; en particular, `asyncua` es
+**LGPL-3.0-or-later**, por lo que al distribuir la imagen deben conservarse sus
+avisos y textos de licencia.
