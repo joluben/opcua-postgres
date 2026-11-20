@@ -123,11 +123,29 @@ printf '%s' 'LA_CONTRASEÑA_REAL' > secrets/postgres_password.txt
 mkdir -p certs
 openssl req -x509 -newkey rsa:2048 \
   -keyout certs/client_key.pem -out certs/client_cert.pem \
-  -days 1095 -nodes -subj "/CN=OPCUAConnector/O=MiEmpresa/C=CO"
+  -days 1095 -nodes -subj "/CN=OPCUAConnector/O=MiEmpresa/C=CO" \
+  -addext "subjectAltName=URI:urn:acasa:conector-01,URI:urn:example.org:FreeOpcUa:opcua-asyncio,DNS:$(hostname)"
 ```
 
 El certificado debe **importarse/aprobarse** en el servidor OPC-UA (Siemens, Rockwell,
 Ignition, etc.). Se montan en `/certs` en solo lectura.
+
+Durante `CreateSession` el servidor comprueba que la *Application URI* que anuncia el
+cliente figura en el SAN (`URI`) del certificado; si no, rechaza la sesión con
+**`BadCertificateUriInvalid`**. El conector anuncia por defecto la URI de `asyncua`
+(`urn:example.org:FreeOpcUa:opcua-asyncio`), por lo que el certificado debe incluirla
+(como en el ejemplo) **o** definir `OPC_APPLICATION_URI` con una de las URIs del
+certificado:
+
+```bash
+# .env
+OPC_APPLICATION_URI=urn:acasa:conector-01
+```
+
+Sin la variable, el comportamiento es el de siempre (URI por defecto de `asyncua`).
+Se recomienda **un certificado y una URI propios por conector**: reutilizar el
+certificado de otra aplicación (p. ej. UaExpert) comparte su clave privada y su URI,
+y varios servidores asocian sesión y certificado por URI única.
 
 ### 4. Desplegar
 
@@ -291,6 +309,7 @@ crash no duplica filas. En CI se ejecuta en el job `integration`.
 | `opc_connector_spill_bytes` crece | BD caída: el buffer se está volcando a disco | Normal y esperado; los datos se reinyectan al recuperar la BD. Vigilar espacio en disco del volumen de spill |
 | `opc_connector_spill_dropped_total` o `opc_connector_values_dropped_total` crecen | Spill lleno (`POSTGRES_SPILL_MAX_MB`) o spill deshabilitado | Ampliar `POSTGRES_SPILL_MAX_MB`/disco, o `OPC_QUEUE_MAX_SIZE`; definir SLA de pérdida |
 | `/health` 503 con `opc_connected=false` | Sesión OPC-UA perdida | El conector reconecta con backoff; revisar red/`MaxSessionCount` |
+| Sesión OPC rechazada: `BadCertificateUriInvalid` (*The URI specified in the ApplicationDescription does not match the URI in the certificate*) | La *Application URI* anunciada no figura en el SAN (`URI`) del certificado de cliente | Buscar el warning `opc_application_uri_mismatch` (lista las URIs del certificado) y definir `OPC_APPLICATION_URI` con una de ellas, o regenerar el certificado con la URI en `subjectAltName` (ver §3) |
 | Arranque falla: *extensión TimescaleDB no instalada* | DBA no ejecutó `dba_setup.sql` | Ejecutar el script en la BD remota |
 | Arranque falla: *permiso insuficiente* | Falta `INSERT`/`UPDATE` | Revisar `GRANT` (§8.2 del plan / `dba_setup.sql`) |
 | Arranque falla: *permission denied for schema &lt;POSTGRES_SCHEMA&gt;* | Falta `CREATE` en el schema configurado (PostgreSQL 15+) | Ejecutar `GRANT USAGE, CREATE ON SCHEMA <POSTGRES_SCHEMA> TO connector_user;` |
@@ -365,6 +384,10 @@ versión antigua inserta `event_id=NULL`. Si se desactiva
   `require`/`prefer`/`allow`/`disable` cifran sin verificar el servidor y **generan warning**.
 - Políticas OPC-UA admitidas: `Basic256Sha256`, `Aes128_Sha256_RsaOaep`, `Aes256_Sha256_RsaPss`
   (se rechazan las obsoletas `Basic128Rsa15`/`Basic256`).
+- `OPC_APPLICATION_URI` debe coincidir con el SAN del certificado; si no coincide, el
+  conector **arranca igualmente** (avisa con `opc_application_uri_mismatch` y es el
+  servidor quien rechaza la sesión). El certificado de cliente debe ser propio del
+  conector: no compartir clave privada ni URI con otras aplicaciones.
 - Contenedor sin root; usuario de BD con permisos mínimos; spill en disco con permisos `0700`/`0600`.
 - Nunca loggear variables de entorno completas ni valores de proceso.
 

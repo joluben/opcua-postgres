@@ -7,6 +7,11 @@
 # Fijado a 2.0.x (parcheado contra DoS de chunks PYSEC-2026-2385).
 asyncua~=2.0.1
 
+# Lectura del SubjectAlternativeName del certificado de cliente para comprobar
+# que OPC_APPLICATION_URI está incluida (DER/PEM). Ya era dependencia transitiva
+# de asyncua; se declara como directa al usarse directamente en el conector.
+cryptography~=50.0.2
+
 # PostgreSQL async driver (alto rendimiento, COPY). 0.31.x → PG 17–18.
 asyncpg~=0.31.0
 

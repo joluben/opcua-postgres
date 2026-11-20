@@ -1,8 +1,16 @@
 """Tests de configuración y seguridad (sin dependencias externas)."""
 
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
+
 import pytest
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.x509.oid import NameOID
 
 from connector.config import Config, ConfigError, _read_secret
+from connector.opc import security
 
 
 def _base_env(monkeypatch):
@@ -18,6 +26,7 @@ def _base_env(monkeypatch):
     for var in ("OPC_PASSWORD_FILE", "POSTGRES_PASSWORD_FILE",
                 "OPC_CERTIFICATE_PATH", "OPC_PRIVATE_KEY_PATH",
                 "OPC_TAG_OFFSET", "OPC_TAG_LIMIT", "OPC_ALLOW_TAG_OMISSION",
+                "OPC_APPLICATION_URI",
                 "POSTGRES_TIMESCALE_CHUNK_INTERVAL",
                 "POSTGRES_TIMESCALE_COMPRESSION_INTERVAL",
                 "POSTGRES_TIMESCALE_RETENTION_INTERVAL"):
@@ -227,3 +236,149 @@ def test_invalid_schema_is_rejected(monkeypatch, raw):
 
     with pytest.raises(ConfigError, match="POSTGRES_SCHEMA"):
         Config.from_env()
+
+
+# ── OPC_APPLICATION_URI ─────────────────────────────────────────────────────
+
+def test_application_uri_defaults_to_none(monkeypatch):
+    """Sin la variable, el cliente conserva la URI por defecto de asyncua."""
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+
+    assert Config.from_env().opc.application_uri is None
+
+
+@pytest.mark.parametrize(
+    "raw",
+    ["urn:acasa-opcua0:UnifiedAutomation:UaExpert", "https://host.example/conector"],
+)
+def test_application_uri_is_read_from_environment(monkeypatch, raw):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv("OPC_APPLICATION_URI", raw)
+
+    assert Config.from_env().opc.application_uri == raw
+
+
+@pytest.mark.parametrize(
+    "raw", ["opcua-sin-esquema", "urn:", "urn:con espacio", "urn:salto\nde-linea"]
+)
+def test_invalid_application_uri_is_rejected(monkeypatch, raw):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv("OPC_APPLICATION_URI", raw)
+
+    with pytest.raises(ConfigError, match="OPC_APPLICATION_URI"):
+        Config.from_env()
+
+
+@pytest.fixture
+def log_events(monkeypatch):
+    """Captura los eventos structlog emitidos por connector.opc.security."""
+    events = []
+
+    def _record(event, **kwargs):
+        events.append((event, kwargs))
+
+    monkeypatch.setattr(
+        security, "log",
+        SimpleNamespace(info=_record, warning=_record, error=_record),
+    )
+    return events
+
+
+def _write_cert(tmp_path, uris, *, der=True):
+    """Certificado autofirmado de prueba; ``uris=None`` → sin extensión SAN."""
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "connector-test")])
+    now = datetime.now(timezone.utc)
+    builder = (
+        x509.CertificateBuilder()
+        .subject_name(name)
+        .issuer_name(name)
+        .public_key(key.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now - timedelta(days=1))
+        .not_valid_after(now + timedelta(days=1))
+    )
+    if uris is not None:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName(
+                [x509.UniformResourceIdentifier(uri) for uri in uris]
+                + [x509.DNSName("connector-host")]
+            ),
+            critical=False,
+        )
+    cert = builder.sign(key, hashes.SHA256())
+    encoding = serialization.Encoding.DER if der else serialization.Encoding.PEM
+    path = tmp_path / ("client_cert.der" if der else "client_cert.pem")
+    path.write_bytes(cert.public_bytes(encoding))
+    return path
+
+
+def _opc_cfg(monkeypatch, cert_path, application_uri):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv("OPC_CERTIFICATE_PATH", str(cert_path))
+    if application_uri is not None:
+        monkeypatch.setenv("OPC_APPLICATION_URI", application_uri)
+    return Config.from_env().opc
+
+
+@pytest.mark.parametrize(("der", "uri"), [
+    (True, "urn:acasa:conector-01"),
+    (False, "urn:acasa:conector-02"),
+])
+def test_matching_application_uri_does_not_warn(monkeypatch, tmp_path, log_events,
+                                                der, uri):
+    cert = _write_cert(tmp_path, [uri], der=der)
+
+    security._check_application_uri(_opc_cfg(monkeypatch, cert, uri))
+
+    assert log_events == []
+
+
+@pytest.mark.parametrize("der", [True, False])
+def test_mismatched_application_uri_warns(monkeypatch, tmp_path, log_events, der):
+    cert = _write_cert(tmp_path, ["urn:otra:aplicacion"], der=der)
+
+    security._check_application_uri(
+        _opc_cfg(monkeypatch, cert, "urn:acasa:conector-01")
+    )
+
+    assert [event for event, _ in log_events] == ["opc_application_uri_mismatch"]
+    _, kwargs = log_events[0]
+    assert kwargs["application_uri"] == "urn:acasa:conector-01"
+    assert kwargs["certificate_uris"] == ["urn:otra:aplicacion"]
+
+
+def test_certificate_without_san_warns(monkeypatch, tmp_path, log_events):
+    cert = _write_cert(tmp_path, None)
+
+    security._check_application_uri(
+        _opc_cfg(monkeypatch, cert, "urn:acasa:conector-01")
+    )
+
+    assert [event for event, _ in log_events] == ["opc_application_uri_mismatch"]
+    assert log_events[0][1]["certificate_uris"] == []
+
+
+def test_unreadable_certificate_only_warns(monkeypatch, tmp_path, log_events):
+    """Un certificado ilegible no debe abortar el arranque (diagnóstico best-effort)."""
+    cert = tmp_path / "broken_cert.der"
+    cert.write_bytes(b"no soy un certificado")
+
+    security._check_application_uri(
+        _opc_cfg(monkeypatch, cert, "urn:acasa:conector-01")
+    )
+
+    assert [event for event, _ in log_events] == ["opc_certificate_read_error"]
+
+
+def test_no_application_uri_skips_certificate_check(monkeypatch, tmp_path, log_events):
+    cert = tmp_path / "broken_cert.der"
+    cert.write_bytes(b"no soy un certificado")
+
+    security._check_application_uri(_opc_cfg(monkeypatch, cert, None))
+
+    assert log_events == []

@@ -4,4 +4,4 @@ Ingesta de señales OPC-UA por suscripción DataChange y persistencia por lotes
 en TimescaleDB (servidor de base de datos independiente).
 """
 
-__version__ = "1.1.0"
+__version__ = "1.0.1"

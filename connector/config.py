@@ -136,6 +136,24 @@ def _opt(name: str) -> Optional[str]:
     return value if value else None
 
 
+# URI de aplicación OPC-UA: esquema obligatorio (``urn:...`` o ``scheme://...``)
+# y sin espacios ni caracteres de control. Se anuncia en CreateSession y se
+# registra en logs, así que no se admite texto arbitrario.
+_APPLICATION_URI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:[^\s]+$")
+
+
+def _application_uri(name: str) -> Optional[str]:
+    value = _opt(name)
+    if value is None:
+        return None
+    if not _APPLICATION_URI_RE.match(value):
+        raise ConfigError(
+            f"{name} debe ser una URI con esquema (p.ej. 'urn:acasa:conector-01' "
+            f"o 'https://host/conector') y sin espacios, recibido: {value!r}"
+        )
+    return value
+
+
 def _bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None or raw == "":
@@ -189,6 +207,9 @@ class OpcConfig:
     allow_tag_omission: bool
     session_timeout_ms: int
     queue_max_size: int
+    # URI anunciada en CreateSession. Debe figurar en el SAN (URI) del
+    # certificado de cliente. None = default de asyncua (comportamiento previo).
+    application_uri: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -311,6 +332,7 @@ class Config:
             allow_tag_omission=_bool("OPC_ALLOW_TAG_OMISSION", False),
             session_timeout_ms=_int("OPC_SESSION_TIMEOUT_MS", 30000, min_value=5000),
             queue_max_size=_int("OPC_QUEUE_MAX_SIZE", 500000, min_value=1000),
+            application_uri=_application_uri("OPC_APPLICATION_URI"),
         )
 
         ssl_mode = os.getenv("POSTGRES_SSL_MODE", "verify-full")

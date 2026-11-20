@@ -18,6 +18,11 @@ async def connect(cfg: OpcConfig) -> Client:
     """
     client = Client(url=cfg.server_url, timeout=cfg.session_timeout_ms / 1000.0)
     client.session_timeout = cfg.session_timeout_ms
+    # Debe fijarse antes de apply_security: asyncua valida el certificado contra
+    # esta URI al cargarlo y la anuncia en el ApplicationDescription de
+    # CreateSession, donde el servidor la compara con el SAN del certificado.
+    if cfg.application_uri:
+        client.application_uri = cfg.application_uri
     await apply_security(client, cfg)
 
     log.info("opc_connecting", url=cfg.server_url)
