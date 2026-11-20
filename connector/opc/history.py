@@ -38,6 +38,7 @@ from ..utils import metrics
 from ..utils.event_id import deterministic_event_id
 from ..utils.ident import qualified_name
 from ..utils.logger import get_logger
+from ..utils.status import to_quality
 
 log = get_logger(__name__)
 
@@ -146,7 +147,8 @@ def datavalue_to_record(
         value_num, value_str = None, None if value is None else str(value)
 
     status = getattr(data_value, "StatusCode", None)
-    quality = int(getattr(status, "value", status) or 0)
+    # StatusCode es uint32; la columna `quality` es INTEGER (int32 con signo).
+    quality = to_quality(getattr(status, "value", status) or 0)
     event_id = deterministic_event_id(
         tag_id, ts, value_num, value_str, quality, connector_id
     )

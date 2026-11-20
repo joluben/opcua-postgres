@@ -21,10 +21,12 @@ from types import SimpleNamespace
 
 import asyncpg
 import pytest
+from asyncua import ua
 
 from connector.db.initializer import initialize_schema
 from connector.db.spill import SpillBuffer
 from connector.db.writer import BatchWriter
+from connector.utils.status import to_quality
 
 pytestmark = [
     pytest.mark.integration,
@@ -138,9 +140,9 @@ def _spill_cfg(tmp_path) -> SimpleNamespace:
     )
 
 
-def _record(tag_id: int) -> tuple:
+def _record(tag_id: int, quality: int = 0) -> tuple:
     return (
-        uuid.uuid4(), tag_id, datetime.now(timezone.utc), 1.0, None, 0,
+        uuid.uuid4(), tag_id, datetime.now(timezone.utc), 1.0, None, quality,
         "connector-acceptance",
     )
 
@@ -237,6 +239,38 @@ async def test_duplicate_batch_is_idempotent():
         assert first == 5
         assert second == 0
         assert total == 5
+    finally:
+        async with pool.acquire() as conn:
+            await _drop(conn, data, catalog)
+        await pool.close()
+
+
+@pytest.mark.asyncio
+async def test_bad_status_code_quality_fits_int32():
+    """Regresión: un StatusCode *Bad* (uint32 ≥ 0x80000000) desbordaba `quality`
+    INTEGER y hacía fallar el COPY de todo el lote (`OverflowError`)."""
+    catalog, data, pool = await _prepare_schema()
+    try:
+        tag_id = await _tag_id(pool, catalog)
+        bad = ua.StatusCodes.BadNodeIdUnknown
+        batch = [_record(tag_id), _record(tag_id, to_quality(bad))]
+        writer = BatchWriter(
+            pool=pool,
+            cfg=_writer_cfg(data, dedup=True),
+            queue=None,
+        )
+
+        async with pool.acquire() as conn:
+            inserted = await writer._insert_dedup(conn, batch)
+            stored = await conn.fetch(
+                f"SELECT quality, (quality::bigint & 4294967295) AS unsigned "
+                f"FROM {_q(data)} ORDER BY quality"
+            )
+
+        assert inserted == 2
+        assert [row["quality"] for row in stored] == [to_quality(bad), 0]
+        # El código OPC-UA original se recupera sin pérdida.
+        assert stored[0]["unsigned"] == int(bad)
     finally:
         async with pool.acquire() as conn:
             await _drop(conn, data, catalog)

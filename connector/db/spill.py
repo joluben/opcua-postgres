@@ -44,6 +44,7 @@ from ..config import DbConfig
 from ..utils import metrics
 from ..utils.event_id import deterministic_event_id
 from ..utils.logger import get_logger
+from ..utils.status import to_quality
 
 log = get_logger(__name__)
 
@@ -111,13 +112,14 @@ def _decode(a: list) -> Record:
     if len(a) >= 7:
         return (
             uuid.UUID(a[0]), int(a[1]), datetime.fromisoformat(a[2]),
-            a[3], a[4], a[5], a[6],
+            a[3], a[4], to_quality(a[5]), a[6],
         )
     tag_id, ts_raw, value_num, value_str, quality, connector_id = a[:6]
     ts = datetime.fromisoformat(ts_raw)
+    quality = to_quality(quality)
     return (
         _legacy_event_id(tag_id, ts, value_num, value_str, quality, connector_id),
-        int(tag_id), ts, value_num, value_str, int(quality), connector_id,
+        int(tag_id), ts, value_num, value_str, quality, connector_id,
     )
 
 

@@ -18,6 +18,7 @@ from ..db.spill import SpillBuffer, enqueue_or_spill
 from ..utils import metrics
 from ..utils.event_id import deterministic_event_id
 from ..utils.logger import get_logger
+from ..utils.status import to_quality
 from .browser import Tag
 
 log = get_logger(__name__)
@@ -78,7 +79,8 @@ class SubHandler:
 
         dv = data.monitored_item.Value
         ts = getattr(dv, "SourceTimestamp", None) or datetime.now(timezone.utc)
-        status = dv.StatusCode.value if dv.StatusCode is not None else 0
+        # StatusCode es uint32; la columna `quality` es INTEGER (int32 con signo).
+        status = to_quality(dv.StatusCode.value if dv.StatusCode is not None else 0)
 
         if isinstance(val, (int, float, bool)):
             value_num, value_str = float(val), None
@@ -90,13 +92,13 @@ class SubHandler:
         # mismo dato se entrega dos veces por solape tiempo real/histórico.
         record = (
             deterministic_event_id(
-                tag_id, ts, value_num, value_str, int(status), self._connector_id
+                tag_id, ts, value_num, value_str, status, self._connector_id
             ),
             tag_id,
             ts,
             value_num,
             value_str,
-            int(status),
+            status,
             self._connector_id,
         )
         enqueue_or_spill(self._queue, record, self._spill)
