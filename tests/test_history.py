@@ -105,7 +105,7 @@ async def test_load_watermarks_groups_by_tag():
         def acquire(self):
             return _Acquire()
 
-    marks = await load_watermarks(_Pool(), "opc_raw_values")
+    marks = await load_watermarks(_Pool(), "public", "opc_raw_values")
     assert marks[1] == datetime(2026, 1, 1, tzinfo=timezone.utc)
     assert 2 not in marks
 

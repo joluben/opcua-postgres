@@ -19,6 +19,7 @@ class FakePool:
 def _cfg(**overrides):
     db = SimpleNamespace(
         num_writers=2,
+        schema="opcua",
         data_table="opc_raw_values",
         batch_size=10,
         flush_interval_ms=500,

@@ -119,12 +119,14 @@ jobs:
           PGPASSWORD: admin
         run: |
           sed "s/PASSWORD 'SECRET'/PASSWORD 'acceptance'/" scripts/dba_setup.sql > /tmp/dba.sql
-          psql -h localhost -U postgres -d scada_db -v ON_ERROR_STOP=1 -f /tmp/dba.sql
+          psql -h localhost -U postgres -d scada_db -v ON_ERROR_STOP=1 \
+            -v schema_name=opcua -f /tmp/dba.sql
 
       - name: Run acceptance tests
         env:
           ACCEPTANCE_ADMIN_DSN: postgresql://postgres:admin@localhost:5432/scada_db
           ACCEPTANCE_CONNECTOR_DSN: postgresql://connector_user:acceptance@localhost:5432/scada_db
+          ACCEPTANCE_SCHEMA: opcua
         run: python -m pytest tests/integration -q -m integration --tb=short
 
   # ── Job 3: Build + Push ───────────────────────────────────────────────────

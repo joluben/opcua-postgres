@@ -33,6 +33,7 @@ import asyncpg
 
 from ..config import DbConfig
 from ..utils import metrics
+from ..utils.ident import qualified_name
 from ..utils.logger import get_logger
 from .spill import SpillBuffer, enqueue_or_spill
 
@@ -125,7 +126,12 @@ class BatchWriter:
         self._queue = queue
         self._spill = spill
         self._health = health
-        self._table = getattr(cfg, "data_table", "opc_raw_values")
+        # ``copy_records_to_table`` no acepta un nombre cualificado (lo citaría
+        # como un único identificador): se le pasa el schema por separado. Para
+        # el INSERT del camino dedup se usa la forma cualificada.
+        self._schema = cfg.schema
+        self._table_name = cfg.data_table
+        self._table_sql = qualified_name(cfg.schema, cfg.data_table)
         self._batch_size = int(getattr(cfg, "batch_size", 1000))
         self._flush_s = float(getattr(cfg, "flush_interval_ms", 500)) / 1000.0
         self._stop = asyncio.Event()
@@ -260,7 +266,10 @@ class BatchWriter:
                 else:
                     try:
                         await conn.copy_records_to_table(
-                            self._table, records=batch, columns=_COLUMNS
+                            self._table_name,
+                            schema_name=self._schema,
+                            records=batch,
+                            columns=_COLUMNS,
                         )
                     except asyncpg.UniqueViolationError:
                         # Puede quedar un índice único de una ejecución previa
@@ -287,7 +296,7 @@ class BatchWriter:
                 received=len(batch),
                 duration_ms=round(duration * 1000, 1),
                 lag_s=round(lag, 2),
-                table=self._table,
+                table=self._table_name,
                 worker=self._worker_id,
             )
             return True
@@ -341,7 +350,7 @@ class BatchWriter:
                     stage, records=batch, columns=_COLUMNS
                 )
                 inserted_rows = await conn.fetch(
-                    f"INSERT INTO {self._table} ({_COLUMNS_SQL}) "
+                    f"INSERT INTO {self._table_sql} ({_COLUMNS_SQL}) "
                     f"SELECT {_COLUMNS_SQL} FROM {stage} "
                     f"ON CONFLICT (event_id, ts) WHERE event_id IS NOT NULL "
                     f"DO NOTHING RETURNING 1"

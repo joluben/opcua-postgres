@@ -22,7 +22,7 @@ def test_requeue_drops_oldest_when_full():
     queue.put_nowait(("old1",))
     queue.put_nowait(("old2",))
 
-    cfg = SimpleNamespace(data_table="t", batch_size=10, flush_interval_ms=500)
+    cfg = SimpleNamespace(schema="public", data_table="t", batch_size=10, flush_interval_ms=500)
     writer = BatchWriter(pool=None, cfg=cfg, queue=queue)
 
     writer._requeue([("new1",)])
@@ -55,7 +55,7 @@ async def test_final_drain_spills_remaining_queue_when_db_down():
         queue.put_nowait((i,))
 
     spill = _FakeSpill()
-    cfg = SimpleNamespace(data_table="t", batch_size=2, flush_interval_ms=500)
+    cfg = SimpleNamespace(schema="public", data_table="t", batch_size=2, flush_interval_ms=500)
     writer = BatchWriter(
         pool=_FailingPool(), cfg=cfg, queue=queue, spill=spill, worker_id=0,
     )
@@ -106,7 +106,7 @@ class _DedupConn:
 @pytest.mark.asyncio
 async def test_insert_dedup_uses_stage_and_on_conflict():
     cfg = SimpleNamespace(
-        data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
+        schema="public", data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
         dedup_enabled=True,
     )
     writer = BatchWriter(pool=None, cfg=cfg, queue=asyncio.Queue())
@@ -141,7 +141,7 @@ class _FailingDedupConn(_DedupConn):
 @pytest.mark.asyncio
 async def test_insert_dedup_drops_stage_when_transaction_fails():
     cfg = SimpleNamespace(
-        data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
+        schema="public", data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
         dedup_enabled=True,
     )
     writer = BatchWriter(pool=None, cfg=cfg, queue=asyncio.Queue())
@@ -157,7 +157,7 @@ async def test_insert_dedup_drops_stage_when_transaction_fails():
 @pytest.mark.asyncio
 async def test_insert_dedup_uses_unique_stage_table_per_attempt():
     cfg = SimpleNamespace(
-        data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
+        schema="public", data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
         dedup_enabled=True,
     )
     writer = BatchWriter(pool=None, cfg=cfg, queue=asyncio.Queue())
@@ -178,7 +178,7 @@ async def test_drop_stage_swallow_errors_but_not_cancellation():
 
     writer = BatchWriter(
         pool=None,
-        cfg=SimpleNamespace(data_table="t", batch_size=10, flush_interval_ms=500),
+        cfg=SimpleNamespace(schema="public", data_table="t", batch_size=10, flush_interval_ms=500),
         queue=asyncio.Queue(),
     )
 
@@ -202,7 +202,7 @@ async def test_shutdown_drop_is_counted_when_spill_rejects():
     from connector.utils import metrics
 
     before = metrics.SHUTDOWN_DROPPED._value.get()
-    cfg = SimpleNamespace(data_table="t", batch_size=10, flush_interval_ms=500)
+    cfg = SimpleNamespace(schema="public", data_table="t", batch_size=10, flush_interval_ms=500)
     writer = BatchWriter(
         pool=None, cfg=cfg, queue=asyncio.Queue(), spill=_RejectingSpill(),
     )
@@ -236,7 +236,9 @@ class _CopyConn:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
 
-    async def copy_records_to_table(self, table, *, records, columns):
+    async def copy_records_to_table(
+        self, table_name, *, records, columns, schema_name=None
+    ):
         if self.fail:
             raise RuntimeError("db down")
 
@@ -262,10 +264,49 @@ class _Pool:
 
 def _writer_with(spill, conn, *, dedup=False):
     cfg = SimpleNamespace(
-        data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
+        schema="public", data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
         dedup_enabled=dedup,
     )
     return BatchWriter(pool=_Pool(conn), cfg=cfg, queue=asyncio.Queue(), spill=spill)
+
+
+@pytest.mark.asyncio
+async def test_flush_writes_into_configured_schema():
+    """COPY se dirige al schema configurado, nunca al schema por defecto."""
+    copied = {}
+
+    class _Conn:
+        async def copy_records_to_table(
+            self, table_name, *, records, columns, schema_name=None
+        ):
+            copied["table"] = table_name
+            copied["schema"] = schema_name
+
+    cfg = SimpleNamespace(
+        schema="opcua", data_table="opc_raw_values", batch_size=10,
+        flush_interval_ms=500, dedup_enabled=False,
+    )
+    writer = BatchWriter(pool=_Pool(_Conn()), cfg=cfg, queue=asyncio.Queue())
+
+    assert await writer._flush([("r",)], requeue_on_failure=False) is True
+    assert copied == {"table": "opc_raw_values", "schema": "opcua"}
+
+
+@pytest.mark.asyncio
+async def test_dedup_insert_is_qualified_with_configured_schema():
+    cfg = SimpleNamespace(
+        schema="opcua", data_table="opc_raw_values", batch_size=10,
+        flush_interval_ms=500, dedup_enabled=True,
+    )
+    writer = BatchWriter(pool=None, cfg=cfg, queue=asyncio.Queue())
+    conn = _DedupConn()
+
+    await writer._insert_dedup(conn, [(1,)])
+
+    insert_sql = [q for q in conn.executed if q.startswith("INSERT INTO")]
+    assert insert_sql and insert_sql[0].startswith(
+        'INSERT INTO "opcua"."opc_raw_values"'
+    )
 
 
 @pytest.mark.asyncio
@@ -273,7 +314,7 @@ async def test_flush_updates_health_state():
     from connector.utils import metrics
 
     cfg = SimpleNamespace(
-        data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
+        schema="public", data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
         dedup_enabled=False,
     )
     health = metrics.HealthState()
@@ -325,14 +366,16 @@ async def test_replay_nacks_on_failure_without_requeue():
 class _UniqueViolationConn:
     """COPY falla como si existiera un índice único preexistente."""
 
-    async def copy_records_to_table(self, table, *, records, columns):
+    async def copy_records_to_table(
+        self, table_name, *, records, columns, schema_name=None
+    ):
         raise asyncpg.UniqueViolationError("duplicate key value")
 
 
 @pytest.mark.asyncio
 async def test_unique_violation_falls_back_to_dedup_without_requeue():
     cfg = SimpleNamespace(
-        data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
+        schema="public", data_table="opc_raw_values", batch_size=10, flush_interval_ms=500,
         dedup_enabled=False,
     )
     writer = BatchWriter(

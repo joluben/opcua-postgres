@@ -24,10 +24,20 @@ GRANT CONNECT ON DATABASE scada_db TO connector_user;
 -- temporary tables in database". PUBLIC lo tiene por defecto; se hace explícito
 -- para que sobreviva a un endurecimiento del rol o a un REVOKE sobre PUBLIC.
 GRANT TEMP ON DATABASE scada_db TO connector_user;
--- PostgreSQL 15+ ya no concede CREATE sobre el schema public a PUBLIC.
--- El conector crea sus tablas de forma idempotente en la primera conexión,
--- por lo que necesita CREATE además de USAGE.
-GRANT USAGE, CREATE ON SCHEMA public TO connector_user;
+
+-- 2.1. Schema de trabajo del conector (POSTGRES_SCHEMA)
+--      El conector crea sus tablas de forma idempotente en el schema indicado
+--      por POSTGRES_SCHEMA; NO usa `public` y NO crea el schema: si no existe,
+--      registra un error y aborta el arranque. Ajustar al mismo valor que
+--      POSTGRES_SCHEMA:
+--          psql ... -v schema_name=opcua -f scripts/dba_setup.sql
+\if :{?schema_name}
+\else
+  \set schema_name opcua
+\endif
+
+CREATE SCHEMA IF NOT EXISTS :"schema_name" AUTHORIZATION connector_user;
+GRANT USAGE, CREATE ON SCHEMA :"schema_name" TO connector_user;
 
 -- 3. Permisos sobre las tablas configuradas
 --    Catálogo: el conector actualiza updated_at y marca active=false => requiere UPDATE.
@@ -35,15 +45,15 @@ GRANT USAGE, CREATE ON SCHEMA public TO connector_user;
 --     al ser el creador, es propietario y tiene todos los permisos. Los DEFAULT
 --     PRIVILEGES deben declararse FOR ROLE connector_user para que apliquen a los
 --     objetos que cree ese rol, no a los que cree el DBA.)
-ALTER DEFAULT PRIVILEGES FOR ROLE connector_user IN SCHEMA public
+ALTER DEFAULT PRIVILEGES FOR ROLE connector_user IN SCHEMA :"schema_name"
     GRANT SELECT, INSERT, UPDATE ON TABLES TO connector_user;
-ALTER DEFAULT PRIVILEGES FOR ROLE connector_user IN SCHEMA public
+ALTER DEFAULT PRIVILEGES FOR ROLE connector_user IN SCHEMA :"schema_name"
     GRANT USAGE, SELECT ON SEQUENCES TO connector_user;
 
 -- Si las tablas ya existen, conceder explícitamente:
--- GRANT SELECT, INSERT, UPDATE ON opc_tags_catalog TO connector_user;
--- GRANT SELECT, INSERT ON opc_raw_values TO connector_user;
--- GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO connector_user;
+-- GRANT SELECT, INSERT, UPDATE ON :"schema_name".opc_tags_catalog TO connector_user;
+-- GRANT SELECT, INSERT ON :"schema_name".opc_raw_values TO connector_user;
+-- GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA :"schema_name" TO connector_user;
 
 -- 4. (Opcional) Tuning recomendado para alta ingesta — ver §15.2 del plan.
 --    Aplicar en postgresql.conf y reiniciar:

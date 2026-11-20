@@ -25,7 +25,6 @@ Limitaciones deliberadas:
 from __future__ import annotations
 
 import asyncio
-import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -37,11 +36,11 @@ from asyncua import ua
 from ..db.spill import SpillBuffer, enqueue_or_spill
 from ..utils import metrics
 from ..utils.event_id import deterministic_event_id
+from ..utils.ident import qualified_name
 from ..utils.logger import get_logger
 
 log = get_logger(__name__)
 
-_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MAX_PAGES = 10_000
 _CAPACITY_SLEEP_S = 0.05
 
@@ -78,20 +77,15 @@ class GapResult:
     error: Optional[str] = None
 
 
-def _validate_table(name: str) -> str:
-    if not _IDENT_RE.match(name):
-        raise ValueError(f"Nombre de tabla inválido: {name!r}")
-    return name
-
-
 async def load_watermarks(
-    pool: asyncpg.Pool, data_table: str
+    pool: asyncpg.Pool, schema: str, data_table: str
 ) -> Dict[int, datetime]:
     """Último ``ts`` persistido por tag (fuente: PostgreSQL).
 
     Se ejecuta una vez por sesión. Si la tabla está vacía devuelve ``{}``.
+    La tabla se cualifica con el schema configurado (``POSTGRES_SCHEMA``).
     """
-    table = _validate_table(data_table)
+    table = qualified_name(schema, data_table)
     async with pool.acquire() as conn:
         rows = await conn.fetch(
             f"SELECT tag_id, MAX(ts) AS last_ts FROM {table} GROUP BY tag_id"

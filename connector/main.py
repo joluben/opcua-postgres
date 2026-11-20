@@ -80,7 +80,9 @@ async def _run_opc_session(
             watermarks: dict[int, datetime] = {}
             if cfg.history_recovery_enabled:
                 try:
-                    watermarks = await load_watermarks(pool, cfg.db.data_table)
+                    watermarks = await load_watermarks(
+                        pool, cfg.db.schema, cfg.db.data_table
+                    )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("history_watermark_failed", error=str(exc))
 
@@ -179,7 +181,13 @@ async def main() -> None:
     configure_logging(cfg.log_level, cfg.log_format, cfg.connector_id)
     # P0: versión única desde build-arg (ENV VERSION) sin divergencia con main.
     version = os.getenv("VERSION", os.getenv("CONNECTOR_VERSION", "dev"))
-    log.info("connector_start", version=version, db_host=cfg.db.host, opc_url=cfg.opc.server_url)
+    log.info(
+        "connector_start",
+        version=version,
+        db_host=cfg.db.host,
+        db_schema=cfg.db.schema,
+        opc_url=cfg.opc.server_url,
+    )
 
     health = metrics.HealthState()
     # METRICS_ENABLED=false (entornos sin Prometheus): no se abre el puerto de

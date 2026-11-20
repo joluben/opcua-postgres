@@ -54,6 +54,7 @@ opcua-postgres/
 │   │   └── spill.py         # Spill a disco con hilo dedicado (batching + fsync)
 │   └── utils/
 │       ├── logger.py        # structlog (JSON)
+│       ├── ident.py         # Validación/citado de schema y tablas (anti-inyección)
 │       ├── metrics.py       # Prometheus + /health (aiohttp)
 │       └── resilience.py    # Backoff exponencial con jitter
 ├── scripts/dba_setup.sql    # Aprovisionamiento del servidor de BD (ejecuta el DBA)
@@ -81,19 +82,30 @@ opcua-postgres/
 En el servidor de BD, ejecutar [`scripts/dba_setup.sql`](scripts/dba_setup.sql):
 
 ```bash
-psql -h <host-bd> -U postgres -d scada_db -f scripts/dba_setup.sql
+psql -h <host-bd> -U postgres -d scada_db \
+  -v schema_name=opcua -f scripts/dba_setup.sql
 ```
 
-Esto instala la extensión TimescaleDB y crea el usuario `connector_user` con permisos
-mínimos (`INSERT`/`SELECT` en datos; `INSERT`/`SELECT`/`UPDATE` en catálogo). Las tablas
-y la hypertable las crea el conector de forma **idempotente** en su primera conexión.
+Esto instala la extensión TimescaleDB, crea el usuario `connector_user` con permisos
+mínimos (`INSERT`/`SELECT` en datos; `INSERT`/`SELECT`/`UPDATE` en catálogo) y crea el
+**schema de trabajo** (`-v schema_name=…`, debe coincidir con `POSTGRES_SCHEMA`). Las tablas
+y la hypertable las crea el conector de forma **idempotente** en su primera conexión,
+**siempre dentro de `POSTGRES_SCHEMA`** (nunca en `public`).
+
+> El conector **no** crea schemas: si `POSTGRES_SCHEMA` no existe, registra
+> `schema_missing` y aborta el arranque con el DDL exacto que debe ejecutar el DBA.
 
 ### 2. Configurar el conector
 
 ```bash
 cp .env.example .env
-# Editar .env: OPC_SERVER_URL, POSTGRES_HOST (host remoto), POSTGRES_USER, etc.
+# Editar .env: OPC_SERVER_URL, POSTGRES_HOST (host remoto), POSTGRES_USER,
+# POSTGRES_SCHEMA (obligatorio), etc.
 ```
+
+> **`POSTGRES_SCHEMA` es obligatorio.** El conector cualifica con él todas las
+> sentencias (`CREATE TABLE`, `COPY`, `INSERT`, `load_watermarks`), así que no
+> depende del `search_path` de la sesión y no escribe en `public` por accidente.
 
 Contraseña de BD vía **Docker Secret** (recomendado):
 
@@ -281,7 +293,9 @@ crash no duplica filas. En CI se ejecuta en el job `integration`.
 | `/health` 503 con `opc_connected=false` | Sesión OPC-UA perdida | El conector reconecta con backoff; revisar red/`MaxSessionCount` |
 | Arranque falla: *extensión TimescaleDB no instalada* | DBA no ejecutó `dba_setup.sql` | Ejecutar el script en la BD remota |
 | Arranque falla: *permiso insuficiente* | Falta `INSERT`/`UPDATE` | Revisar `GRANT` (§8.2 del plan / `dba_setup.sql`) |
-| Arranque falla: *permission denied for schema public* | Falta `CREATE` en el schema (PostgreSQL 15+) | Ejecutar `GRANT USAGE, CREATE ON SCHEMA public TO connector_user;` |
+| Arranque falla: *permission denied for schema &lt;POSTGRES_SCHEMA&gt;* | Falta `CREATE` en el schema configurado (PostgreSQL 15+) | Ejecutar `GRANT USAGE, CREATE ON SCHEMA <POSTGRES_SCHEMA> TO connector_user;` |
+| Arranque falla con `schema_missing` | `POSTGRES_SCHEMA` apunta a un schema que no existe: el conector **no** crea schemas | Ejecutar como DBA `CREATE SCHEMA IF NOT EXISTS <POSTGRES_SCHEMA> AUTHORIZATION connector_user;` (o `scripts/dba_setup.sql -v schema_name=<POSTGRES_SCHEMA>`) |
+| `POSTGRES_SCHEMA` ausente al arrancar | Variable obligatoria (el conector nunca asume `public`) | Definirla en `.env` y en `scripts/dba_setup.sql` con el mismo valor |
 | Arranque falla: *operation not supported on hypertables that have compression enabled* | La hypertable ya está comprimida y **no** tiene el índice único de dedup (BD creada con `POSTGRES_DEDUP_ENABLED=false` o anterior a la Fase 2) | Descomprimir los chunks, crear `uq_<tabla>_event_ts` y reactivar la compresión; o arrancar con `POSTGRES_DEDUP_ENABLED=false` |
 | Arranque repetido: *schema_init_deadlock_retry* | El DDL coincide con el job de compresión de TimescaleDB (habitual con 2 conectores arrancando a la vez) | Transitorio: se reintenta solo (3 intentos). Si persiste, arrancar los conectores en serie |
 | Tags duplicados/huecos entre conectores | Particionamiento no coordinado | Asegurar partición por catálogo (`node_id`), no por browse ad-hoc |

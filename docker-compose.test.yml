@@ -17,6 +17,10 @@ services:
       POSTGRES_PASSWORD: test
     ports:
       - "5432:5432"
+    volumes:
+      # Aprovisiona el schema de trabajo (POSTGRES_SCHEMA). El conector NO crea
+      # schemas: sin este init, arranca fallando porque el schema no existe.
+      - ./scripts/dba_setup.sql:/docker-entrypoint-initdb.d/01_dba_setup.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U connector_user -d scada_db"]
       interval: 5s
@@ -76,6 +80,7 @@ services:
       POSTGRES_DB: scada_db
       POSTGRES_USER: connector_user
       POSTGRES_PASSWORD: test
+      POSTGRES_SCHEMA: opcua
       POSTGRES_SSL_MODE: disable
       POSTGRES_USE_TIMESCALE: "true"
       # Operación

@@ -20,6 +20,9 @@ PG_CONTAINER="${PG_CONTAINER:-opc-acceptance-pg}"
 PG_PORT="${PG_PORT:-55432}"
 PG_ADMIN_PASSWORD="${PG_ADMIN_PASSWORD:-admin}"
 PG_APP_PASSWORD="${PG_APP_PASSWORD:-acceptance}"
+# Schema de trabajo del conector (POSTGRES_SCHEMA). Debe coincidir con el que
+# aprovisiona dba_setup.sql y con el que usan los tests de integración.
+PG_SCHEMA="${PG_SCHEMA:-opcua}"
 PYTHON="${PYTHON:-python3}"
 
 # WSL no propaga variables arbitrarias a un python.exe de Windows salvo que se
@@ -28,7 +31,7 @@ PYTHON="${PYTHON:-python3}"
 case "$PYTHON" in
   *.exe|*.EXE)
     if grep -qi microsoft /proc/version 2>/dev/null; then
-      export WSLENV="${WSLENV:+$WSLENV:}ACCEPTANCE_ADMIN_DSN:ACCEPTANCE_CONNECTOR_DSN:PYTHONPATH"
+      export WSLENV="${WSLENV:+$WSLENV:}ACCEPTANCE_ADMIN_DSN:ACCEPTANCE_CONNECTOR_DSN:ACCEPTANCE_SCHEMA:PYTHONPATH"
     fi
     ;;
 esac
@@ -65,7 +68,8 @@ setup_ok=0
 setup_err="$(mktemp)"
 for _ in $(seq 1 10); do
   if sed "s/PASSWORD 'SECRET'/PASSWORD '${PG_APP_PASSWORD}'/" scripts/dba_setup.sql \
-      | docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 -U postgres -d scada_db \
+      | docker exec -i "$PG_CONTAINER" psql -v ON_ERROR_STOP=1 \
+          -v schema_name="$PG_SCHEMA" -U postgres -d scada_db \
       >/dev/null 2>"$setup_err"; then
     setup_ok=1
     break
@@ -85,5 +89,6 @@ rm -f "$setup_err"
 echo "Ejecutando pruebas de aceptación con connector_user..."
 ACCEPTANCE_ADMIN_DSN="postgresql://postgres:${PG_ADMIN_PASSWORD}@localhost:${PG_PORT}/scada_db" \
 ACCEPTANCE_CONNECTOR_DSN="postgresql://connector_user:${PG_APP_PASSWORD}@localhost:${PG_PORT}/scada_db" \
+ACCEPTANCE_SCHEMA="$PG_SCHEMA" \
 PYTHONPATH="$ROOT" \
 "$PYTHON" -m pytest tests/integration -q -m integration "$@"

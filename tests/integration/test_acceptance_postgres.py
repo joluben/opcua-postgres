@@ -35,6 +35,9 @@ pytestmark = [
 
 _DSN = os.getenv("ACCEPTANCE_CONNECTOR_DSN", "")
 _ADMIN_DSN = os.getenv("ACCEPTANCE_ADMIN_DSN") or _DSN
+# El conector ya no escribe en `public`: las pruebas usan un schema propio que
+# aprovisiona `scripts/dba_setup.sql` (el conector no crea schemas).
+_SCHEMA = os.getenv("ACCEPTANCE_SCHEMA", "opcua")
 
 
 def _names() -> tuple[str, str]:
@@ -42,9 +45,14 @@ def _names() -> tuple[str, str]:
     return f"acc_catalog_{token}", f"acc_data_{token}"
 
 
+def _q(table: str) -> str:
+    return f'"{_SCHEMA}"."{table}"'
+
+
 def _cfg(catalog: str, data: str) -> SimpleNamespace:
     return SimpleNamespace(
         use_timescale=True,
+        schema=_SCHEMA,
         catalog_table=catalog,
         data_table=data,
         dedup_enabled=True,
@@ -52,8 +60,8 @@ def _cfg(catalog: str, data: str) -> SimpleNamespace:
 
 
 async def _drop(conn: asyncpg.Connection, data: str, catalog: str) -> None:
-    await conn.execute(f"DROP TABLE IF EXISTS {data} CASCADE")
-    await conn.execute(f"DROP TABLE IF EXISTS {catalog} CASCADE")
+    await conn.execute(f"DROP TABLE IF EXISTS {_q(data)} CASCADE")
+    await conn.execute(f"DROP TABLE IF EXISTS {_q(catalog)} CASCADE")
 
 
 async def _prepare_schema() -> tuple[str, str, asyncpg.Pool]:
@@ -66,9 +74,19 @@ async def _prepare_schema() -> tuple[str, str, asyncpg.Pool]:
 async def _tag_id(pool: asyncpg.Pool, catalog: str) -> int:
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            f"INSERT INTO {catalog} (node_id, display_name) "
+            f"INSERT INTO {_q(catalog)} (node_id, display_name) "
             f"VALUES ('ns=2;s=Acceptance', 'Acceptance') RETURNING id"
         )
+
+
+def _writer_cfg(data: str, *, dedup: bool) -> SimpleNamespace:
+    return SimpleNamespace(
+        schema=_SCHEMA,
+        data_table=data,
+        batch_size=100,
+        flush_interval_ms=500,
+        dedup_enabled=dedup,
+    )
 
 
 def _spill_cfg(tmp_path) -> SimpleNamespace:
@@ -106,11 +124,15 @@ async def test_connector_role_is_restricted_and_can_initialize_schema():
     try:
         await initialize_schema(pool, _cfg(catalog, data))
         async with pool.acquire() as c:
-            assert await c.fetchval("SELECT to_regclass($1) IS NOT NULL", data)
+            assert await c.fetchval("SELECT to_regclass($1) IS NOT NULL", _q(data))
+            # El conector nunca debe crear objetos en `public`.
+            assert await c.fetchval(
+                "SELECT to_regclass($1) IS NULL", data
+            ), "la tabla se creó en el schema por defecto (public) en vez de en POSTGRES_SCHEMA"
             index = await c.fetchval(
                 "SELECT indexname FROM pg_indexes "
-                "WHERE tablename = $1 AND indexname LIKE 'uq_%_event_ts'",
-                data,
+                "WHERE schemaname = $2 AND tablename = $1 AND indexname LIKE 'uq_%_event_ts'",
+                data, _SCHEMA,
             )
             assert index, "no se creó el índice único de deduplicación"
     finally:
@@ -135,8 +157,8 @@ async def test_initialize_schema_is_idempotent_with_compression_enabled():
         async with pool.acquire() as c:
             compressed = await c.fetchval(
                 "SELECT compression_enabled FROM timescaledb_information.hypertables "
-                "WHERE hypertable_name = $1",
-                data,
+                "WHERE hypertable_schema = $2 AND hypertable_name = $1",
+                data, _SCHEMA,
             )
         assert compressed is True, "la hypertable no quedó comprimida: el test no reproduce el caso"
 
@@ -146,8 +168,8 @@ async def test_initialize_schema_is_idempotent_with_compression_enabled():
         async with pool.acquire() as c:
             index = await c.fetchval(
                 "SELECT indexname FROM pg_indexes "
-                "WHERE tablename = $1 AND indexname LIKE 'uq_%_event_ts'",
-                data,
+                "WHERE schemaname = $2 AND tablename = $1 AND indexname LIKE 'uq_%_event_ts'",
+                data, _SCHEMA,
             )
         assert index, "el índice único de deduplicación desapareció"
     finally:
@@ -164,17 +186,14 @@ async def test_duplicate_batch_is_idempotent():
         batch = [_record(tag_id) for _ in range(5)]
         writer = BatchWriter(
             pool=pool,
-            cfg=SimpleNamespace(
-                data_table=data, batch_size=100, flush_interval_ms=500,
-                dedup_enabled=True,
-            ),
+            cfg=_writer_cfg(data, dedup=True),
             queue=None,
         )
 
         async with pool.acquire() as conn:
             first = await writer._insert_dedup(conn, batch)
             second = await writer._insert_dedup(conn, batch)
-            total = await conn.fetchval(f"SELECT COUNT(*) FROM {data}")
+            total = await conn.fetchval(f"SELECT COUNT(*) FROM {_q(data)}")
 
         assert first == 5
         assert second == 0
@@ -198,10 +217,7 @@ async def test_dedup_disabled_falls_back_when_unique_index_exists():
         batch = [_record(tag_id) for _ in range(4)]
         writer = BatchWriter(
             pool=pool,
-            cfg=SimpleNamespace(
-                data_table=data, batch_size=100, flush_interval_ms=500,
-                dedup_enabled=False,
-            ),
+            cfg=_writer_cfg(data, dedup=False),
             queue=None,
         )
 
@@ -210,7 +226,7 @@ async def test_dedup_disabled_falls_back_when_unique_index_exists():
         assert await writer._flush(batch, requeue_on_failure=False) is True
 
         async with pool.acquire() as conn:
-            total = await conn.fetchval(f"SELECT COUNT(*) FROM {data}")
+            total = await conn.fetchval(f"SELECT COUNT(*) FROM {_q(data)}")
         assert total == len(batch)
     finally:
         async with pool.acquire() as conn:
@@ -245,16 +261,13 @@ async def test_crash_between_replay_and_ack_does_not_duplicate(tmp_path):
             # El primer lote llegó a commit; el replay se intenta de nuevo.
             writer = BatchWriter(
                 pool=pool,
-                cfg=SimpleNamespace(
-                    data_table=data, batch_size=100, flush_interval_ms=500,
-                    dedup_enabled=True,
-                ),
+                cfg=_writer_cfg(data, dedup=True),
                 queue=None,
             )
             async with pool.acquire() as conn:
                 await writer._insert_dedup(conn, first_read.records)
                 await writer._insert_dedup(conn, second_read.records)
-                total = await conn.fetchval(f"SELECT COUNT(*) FROM {data}")
+                total = await conn.fetchval(f"SELECT COUNT(*) FROM {_q(data)}")
             assert total == len(records)
         finally:
             spill2.close()

@@ -5,6 +5,12 @@
 secrets/
 *.secret
 
+# ── Overrides de Compose específicos del host (bind de IP, nº de conectores) ──
+# Se crean en el servidor, nunca se versionan: describen ESTA máquina.
+docker-compose.override.yml
+docker-compose.override.yaml
+docker-compose.local.yml
+
 # ── Certificados OPC-UA y claves privadas ────────────────────────────────────
 certs/
 *.pem

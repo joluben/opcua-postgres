@@ -16,6 +16,7 @@ import asyncpg
 from asyncua import Client, Node, ua
 
 from ..config import DbConfig, OpcConfig
+from ..utils.ident import qualified_name
 from ..utils.logger import get_logger
 from ..utils import metrics
 
@@ -191,13 +192,14 @@ async def discover_and_partition(
     log.info("opc_partition", offset=start, limit=opc.tag_limit, assigned=len(partition))
 
     tags: List[Tag] = []
+    catalog = qualified_name(db.schema, db.catalog_table)
     async with pool.acquire() as conn:
         for node in partition:
             node_id = node.nodeid.to_string()
             meta = await _describe(node)
             tag_id = await conn.fetchval(
                 f"""
-                INSERT INTO {db.catalog_table} (node_id, display_name, data_type, active, updated_at)
+                INSERT INTO {catalog} (node_id, display_name, data_type, active, updated_at)
                 VALUES ($1, $2, $3, TRUE, NOW())
                 ON CONFLICT (node_id) DO UPDATE
                     SET display_name = EXCLUDED.display_name,

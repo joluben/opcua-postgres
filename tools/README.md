@@ -68,7 +68,7 @@ docker compose -f docker-compose.test.yml up --build
 Para verificar datos:
 
 ```powershell
-docker compose -f docker-compose.test.yml exec timescaledb psql -U connector_user -d scada_db -c "SELECT count(*) FROM opc_raw_values;"
+docker compose -f docker-compose.test.yml exec timescaledb psql -U connector_user -d scada_db -c "SELECT count(*) FROM opcua.opc_raw_values;"
 ```
 
 Probar spill/resiliencia: `docker compose -f docker-compose.test.yml stop timescaledb`
@@ -118,8 +118,8 @@ python -m connector.main
 **e) Verificar en BD:**
 
 ```sql
-SELECT count(*) FROM opc_raw_values;
-SELECT * FROM opc_raw_values ORDER BY ts DESC LIMIT 5;
+SELECT count(*) FROM opcua.opc_raw_values;
+SELECT * FROM opcua.opc_raw_values ORDER BY ts DESC LIMIT 5;
 ```
 
 ### Probar resiliencia / spill

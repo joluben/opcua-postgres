@@ -18,6 +18,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .utils.ident import IdentifierError, validate_ident
+
 
 class ConfigError(RuntimeError):
     """Error de configuración (variable obligatoria ausente o inválida)."""
@@ -116,6 +118,19 @@ def _float(name: str, default: float, *, min_value: float | None = None,
     return value
 
 
+def _ident(name: str, default: Optional[str] = None) -> str:
+    """Lee un identificador SQL obligatorio (schema o tabla) y lo valida.
+
+    Se valida en el arranque, no al ejecutar el DDL: un nombre inválido debe
+    fallar antes de abrir conexiones.
+    """
+    value = _required(name) if default is None else os.getenv(name, default)
+    try:
+        return validate_ident(value)
+    except IdentifierError as exc:
+        raise ConfigError(f"{name}: {exc}") from exc
+
+
 def _opt(name: str) -> Optional[str]:
     value = os.getenv(name)
     return value if value else None
@@ -184,6 +199,9 @@ class DbConfig:
     user: str
     password: str
     ssl_mode: str
+    # Schema donde el conector crea y escribe sus tablas (POSTGRES_SCHEMA).
+    # Obligatorio: nunca se asume ``public``.
+    schema: str
     catalog_table: str
     data_table: str
     batch_size: int
@@ -323,8 +341,9 @@ class Config:
             user=_required("POSTGRES_USER"),
             password=_required("POSTGRES_PASSWORD"),
             ssl_mode=ssl_mode,
-            catalog_table=os.getenv("POSTGRES_CATALOG_TABLE", "opc_tags_catalog"),
-            data_table=os.getenv("POSTGRES_DATA_TABLE", "opc_raw_values"),
+            schema=_ident("POSTGRES_SCHEMA"),
+            catalog_table=_ident("POSTGRES_CATALOG_TABLE", "opc_tags_catalog"),
+            data_table=_ident("POSTGRES_DATA_TABLE", "opc_raw_values"),
             batch_size=_int("POSTGRES_BATCH_SIZE", 1000, min_value=10, max_value=50000),
             flush_interval_ms=_int("POSTGRES_FLUSH_INTERVAL_MS", 500, min_value=50),
             pool_min=pool_min,

@@ -11,6 +11,7 @@ def _base_env(monkeypatch):
     monkeypatch.setenv("POSTGRES_DB", "scada_db")
     monkeypatch.setenv("POSTGRES_USER", "connector_user")
     monkeypatch.setenv("POSTGRES_PASSWORD", "secret")
+    monkeypatch.setenv("POSTGRES_SCHEMA", "opcua")
     monkeypatch.setenv("CONNECTOR_ID", "connector-01")
     # P0: aislar de *_FILE del host para que los defaults fail-closed no hereden
     # ficheros inexistentes del entorno local.
@@ -194,4 +195,35 @@ def test_invalid_timescale_interval_is_rejected(monkeypatch):
     )
 
     with pytest.raises(ConfigError, match="POSTGRES_TIMESCALE_RETENTION_INTERVAL"):
+        Config.from_env()
+
+
+# ── POSTGRES_SCHEMA: obligatorio y validado ────────────────────────────────
+
+def test_schema_is_required_and_never_defaults_to_public(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.delenv("POSTGRES_SCHEMA", raising=False)
+
+    with pytest.raises(ConfigError, match="POSTGRES_SCHEMA"):
+        Config.from_env()
+
+
+def test_schema_is_read_from_environment(monkeypatch):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv("POSTGRES_SCHEMA", "catalog")
+
+    assert Config.from_env().db.schema == "catalog"
+
+
+@pytest.mark.parametrize(
+    "raw", ["public; DROP TABLE x", "opc-ua", "1schema", "", "a.b"]
+)
+def test_invalid_schema_is_rejected(monkeypatch, raw):
+    _base_env(monkeypatch)
+    monkeypatch.setenv("OPC_SECURITY_MODE", "None")
+    monkeypatch.setenv("POSTGRES_SCHEMA", raw)
+
+    with pytest.raises(ConfigError, match="POSTGRES_SCHEMA"):
         Config.from_env()
