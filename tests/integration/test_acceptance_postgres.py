@@ -13,6 +13,7 @@ El rol `connector_user` debe existir y haberse aprovisionado con
 
 from __future__ import annotations
 
+import asyncio
 import os
 import uuid
 from datetime import datetime, timezone
@@ -39,6 +40,10 @@ _ADMIN_DSN = os.getenv("ACCEPTANCE_ADMIN_DSN") or _DSN
 # aprovisiona `scripts/dba_setup.sql` (el conector no crea schemas).
 _SCHEMA = os.getenv("ACCEPTANCE_SCHEMA", "opcua")
 
+# El DROP puede chocar con un job de TimescaleDB en vuelo (ver `_drop`).
+_DROP_ATTEMPTS = 4
+_DROP_RETRY_BASE_S = 0.5
+
 
 def _names() -> tuple[str, str]:
     token = uuid.uuid4().hex[:12]
@@ -60,8 +65,42 @@ def _cfg(catalog: str, data: str) -> SimpleNamespace:
 
 
 async def _drop(conn: asyncpg.Connection, data: str, catalog: str) -> None:
-    await conn.execute(f"DROP TABLE IF EXISTS {_q(data)} CASCADE")
-    await conn.execute(f"DROP TABLE IF EXISTS {_q(catalog)} CASCADE")
+    """Borra las tablas creadas por el test.
+
+    `add_compression_policy`/`add_retention_policy` registran jobs cuyo
+    `next_start` es ~ahora, así que el job puede ejecutarse justo cuando el test
+    termina: el `DROP TABLE` espera el advisory lock del job y el job espera el
+    lock de la hypertable → PostgreSQL detecta deadlock. Se desregistran primero
+    las políticas, se acota `lock_timeout` y se reintenta el DROP (mismo patrón
+    que `initialize_schema` aplica a su propio DDL).
+    """
+    await conn.execute("SET lock_timeout = '10s'")
+    try:
+        for policy in ("compression", "retention"):
+            try:
+                await conn.execute(
+                    f"SELECT remove_{policy}_policy($1::regclass, if_exists => TRUE)",
+                    _q(data),
+                )
+            except asyncpg.PostgresError:
+                # Tabla no-hypertable o Timescale sin cargar: el DROP basta.
+                pass
+        for table in (data, catalog):
+            await _drop_table(conn, table)
+    finally:
+        await conn.execute("RESET lock_timeout")
+
+
+async def _drop_table(conn: asyncpg.Connection, table: str) -> None:
+    for attempt in range(1, _DROP_ATTEMPTS + 1):
+        try:
+            await conn.execute(f"DROP TABLE IF EXISTS {_q(table)} CASCADE")
+            return
+        except (asyncpg.exceptions.DeadlockDetectedError,
+                asyncpg.exceptions.LockNotAvailableError):
+            if attempt == _DROP_ATTEMPTS:
+                raise
+            await asyncio.sleep(_DROP_RETRY_BASE_S * attempt)
 
 
 async def _prepare_schema() -> tuple[str, str, asyncpg.Pool]:
