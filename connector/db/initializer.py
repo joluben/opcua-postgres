@@ -250,7 +250,10 @@ async def _create_data_table(
             received_at   TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             value_num     DOUBLE PRECISION,
             value_str     TEXT,
-            quality       INTEGER,
+            -- StatusCode OPC-UA (uint32) almacenado como int32 con signo
+            -- (connector/utils/status.py). BIGINT: no vuelve a crear la tabla
+            -- con un tipo más estrecho que las instalaciones ya parcheadas.
+            quality       BIGINT,
             connector_id  TEXT        NOT NULL
         );
         """

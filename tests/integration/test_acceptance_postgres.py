@@ -248,12 +248,18 @@ async def test_duplicate_batch_is_idempotent():
 @pytest.mark.asyncio
 async def test_bad_status_code_quality_fits_int32():
     """Regresión: un StatusCode *Bad* (uint32 ≥ 0x80000000) desbordaba `quality`
-    INTEGER y hacía fallar el COPY de todo el lote (`OverflowError`)."""
+    y hacía fallar el COPY del lote completo (`OverflowError`)."""
     catalog, data, pool = await _prepare_schema()
     try:
         tag_id = await _tag_id(pool, catalog)
-        bad = ua.StatusCodes.BadNodeIdUnknown
-        batch = [_record(tag_id), _record(tag_id, to_quality(bad))]
+        bad_node = ua.StatusCodes.BadNodeIdUnknown          # 0x80340000
+        bad_wait = ua.StatusCodes.BadWaitingForInitialData   # 0x80320000
+        batch = [
+            _record(tag_id),
+            _record(tag_id, to_quality(bad_node)),
+            # Sin normalizar: la barrera del writer debe convertirlo igualmente.
+            _record(tag_id, int(bad_wait)),
+        ]
         writer = BatchWriter(
             pool=pool,
             cfg=_writer_cfg(data, dedup=True),
@@ -266,11 +272,23 @@ async def test_bad_status_code_quality_fits_int32():
                 f"SELECT quality, (quality::bigint & 4294967295) AS unsigned "
                 f"FROM {_q(data)} ORDER BY quality"
             )
+            quality_type = await conn.fetchval(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = $1 AND table_name = $2 "
+                "AND column_name = 'quality'",
+                _SCHEMA, data,
+            )
 
-        assert inserted == 2
-        assert [row["quality"] for row in stored] == [to_quality(bad), 0]
-        # El código OPC-UA original se recupera sin pérdida.
-        assert stored[0]["unsigned"] == int(bad)
+        assert inserted == 3
+        assert [row["quality"] for row in stored] == [
+            to_quality(bad_wait), to_quality(bad_node), 0,
+        ]
+        # Los códigos OPC-UA originales se recuperan sin pérdida.
+        assert [row["unsigned"] for row in stored[:2]] == [
+            int(bad_wait), int(bad_node),
+        ]
+        # Las instalaciones nuevas deben crear la columna con holgura.
+        assert quality_type == "bigint"
     finally:
         async with pool.acquire() as conn:
             await _drop(conn, data, catalog)

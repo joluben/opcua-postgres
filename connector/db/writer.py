@@ -35,6 +35,7 @@ from ..config import DbConfig
 from ..utils import metrics
 from ..utils.ident import qualified_name
 from ..utils.logger import get_logger
+from ..utils.status import to_quality
 from .spill import SpillBuffer, enqueue_or_spill
 
 log = get_logger(__name__)
@@ -64,7 +65,9 @@ _STAGE_DDL = """
         ts           TIMESTAMPTZ,
         value_num    DOUBLE PRECISION,
         value_str    TEXT,
-        quality      INTEGER,
+        -- BIGINT: la columna real puede ser BIGINT en instalaciones ya
+        -- parcheadas; una staging más estrecha que el destino rompía el COPY.
+        quality      BIGINT,
         connector_id TEXT
     ) ON COMMIT DROP
 """
@@ -86,6 +89,31 @@ def _new_stage_table(worker_id: int = 0) -> str:
     conexión del pool nunca comparten tabla, aunque el anterior no se limpiara.
     """
     return _ident(f"{_STAGE_TABLE_PREFIX}_w{int(worker_id)}_{next(_stage_seq):x}")
+
+
+def _normalize_quality(batch: List[Record]) -> List[Record]:
+    """Última barrera antes del COPY: el StatusCode debe caber en ``quality``.
+
+    Los productores (suscripción, histórico y replay del spill) ya convierten el
+    uint32 de OPC-UA a int32, pero un solo valor fuera de rango hacía fallar el
+    COPY del lote completo (``OverflowError: value out of int32 range``). Es
+    idempotente: los valores ya convertidos no se tocan.
+    """
+    normalized: List[Record] = []
+    for record in batch:
+        if len(record) < 7:
+            # Registro incompleto: lo rechazará el propio COPY con un error claro.
+            normalized.append(record)
+            continue
+        quality = to_quality(record[5])
+        if quality == record[5]:
+            normalized.append(record)
+        else:
+            normalized.append(
+                (record[0], record[1], record[2], record[3], record[4],
+                 quality, record[6])
+            )
+    return normalized
 
 
 def _rows_affected(status: str) -> int:
@@ -248,6 +276,7 @@ class BatchWriter:
     async def _flush(
         self, batch: List[Record], *, requeue_on_failure: bool = True
     ) -> bool:
+        batch = _normalize_quality(batch)
         try:
             lag = _batch_lag_s(batch)
             try:
@@ -342,6 +371,7 @@ class BatchWriter:
         Devuelve las filas realmente insertadas.
         """
         stage = _new_stage_table(self._worker_id)
+        batch = _normalize_quality(batch)
         committed = False
         try:
             async with conn.transaction():

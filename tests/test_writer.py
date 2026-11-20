@@ -1,13 +1,15 @@
 """Tests del BatchWriter: orden de columnas y política drop-oldest."""
 
 import asyncio
+import uuid
+from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import asyncpg
 import pytest
 
 from connector.db.spill import ReplayBatch, ReplayToken
-from connector.db.writer import BatchWriter, _COLUMNS, _rows_affected
+from connector.db.writer import BatchWriter, _COLUMNS, _rows_affected, _STAGE_DDL
 
 
 def test_columns_order_matches_schema():
@@ -112,7 +114,6 @@ async def test_insert_dedup_uses_stage_and_on_conflict():
     writer = BatchWriter(pool=None, cfg=cfg, queue=asyncio.Queue())
     conn = _DedupConn()
     batch = [(i,) for i in range(3)]
-
     inserted = await writer._insert_dedup(conn, batch)
 
     assert inserted == 2
@@ -235,12 +236,14 @@ class _ReplaySpill:
 class _CopyConn:
     def __init__(self, *, fail: bool = False) -> None:
         self.fail = fail
+        self.copied = None
 
     async def copy_records_to_table(
         self, table_name, *, records, columns, schema_name=None
     ):
         if self.fail:
             raise RuntimeError("db down")
+        self.copied = list(records)
 
 
 class _Acquire:
@@ -395,3 +398,46 @@ async def test_unique_violation_falls_back_to_dedup_without_requeue():
     assert ok is True
     assert calls == [3]
     assert writer._queue.empty()
+
+# ── StatusCode OPC-UA (uint32) frente a `quality` (int32) ───────────────────
+
+def _record(quality: int) -> tuple:
+    return (uuid.uuid4(), 1, datetime.now(timezone.utc), 1.0, None, quality,
+            "connector-test")
+
+
+@pytest.mark.asyncio
+async def test_flush_normalizes_out_of_range_quality_before_copy():
+    """Regresión: un StatusCode Bad (uint32) rompía el COPY del lote completo."""
+    conn = _CopyConn()
+    cfg = SimpleNamespace(
+        schema="opcua", data_table="opc_raw_values", batch_size=10,
+        flush_interval_ms=500, dedup_enabled=False,
+    )
+    writer = BatchWriter(pool=_Pool(conn), cfg=cfg, queue=asyncio.Queue())
+
+    ok = await writer._flush([_record(0x80320000)], requeue_on_failure=False)
+
+    assert ok is True
+    assert conn.copied[0][5] == -2144206848  # 0x80320000 como int32
+    assert -(2 ** 31) <= conn.copied[0][5] <= 2 ** 31 - 1
+
+
+@pytest.mark.asyncio
+async def test_insert_dedup_normalizes_quality_before_staging_copy():
+    """El COPY a la tabla temporal también debe recibir valores dentro de rango."""
+    cfg = SimpleNamespace(
+        schema="public", data_table="opc_raw_values", batch_size=10,
+        flush_interval_ms=500, dedup_enabled=True,
+    )
+    writer = BatchWriter(pool=None, cfg=cfg, queue=asyncio.Queue())
+    conn = _DedupConn()
+
+    await writer._insert_dedup(conn, [_record(0x80320000)])
+
+    assert conn.copied[1][0][5] == -2144206848
+
+
+def test_stage_table_quality_is_not_narrower_than_destination():
+    """La staging temporal debe poder con los dos tipos del destino."""
+    assert "quality      BIGINT" in _STAGE_DDL
